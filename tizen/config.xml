@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<widget xmlns="http://www.w3.org/ns/widgets" xmlns:tizen="http://tizen.org/ns/widgets"
+        id="http://github.com/samsung-hongguo-drama" version="1.0.0" viewmodes="maximized">
+    <tizen:application id="HgDrama001.HongguoTV" package="HgDrama001" required_version="4.0"/>
+    <name>红果短剧</name>
+    <description>红果短剧电视版：浏览、搜索与在线播放短剧，全程遥控器操作。</description>
+    <icon src="icon.png"/>
+    <content src="index.html"/>
+    <author>samsung-hongguo-drama contributors</author>
+    <license href="https://www.gnu.org/licenses/gpl-3.0.html">GPL-3.0</license>
+
+    <!-- Sources and media CDNs are reached directly; the runtime lets whitelisted origins bypass CORS. -->
+    <access origin="*" subdomains="true"/>
+    <tizen:allow-navigation>*</tizen:allow-navigation>
+    <tizen:content-security-policy>default-src * 'self' data: blob: 'unsafe-inline'; img-src * data: blob:; media-src * blob: data:; connect-src *;</tizen:content-security-policy>
+
+    <tizen:privilege name="http://tizen.org/privilege/internet"/>
+    <tizen:privilege name="http://tizen.org/privilege/tv.inputdevice"/>
+    <!-- Decrypted App-source episodes are played from a temp file: Tizen will not play blob: MP4s. -->
+    <tizen:privilege name="http://tizen.org/privilege/filesystem.read"/>
+    <tizen:privilege name="http://tizen.org/privilege/filesystem.write"/>
+
+    <tizen:profile name="tv-samsung"/>
+    <feature name="http://tizen.org/feature/screen.size.all"/>
+    <tizen:setting screen-orientation="landscape" context-menu="disable" background-support="disable"
+                   encryption="disable" install-location="auto" hwkey-event="enable"/>
+</widget>

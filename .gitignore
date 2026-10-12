@@ -1,0 +1,7 @@
+node_modules/
+dist/
+build/
+*.wgt
+.DS_Store
+.buildResult/
+.sign/
