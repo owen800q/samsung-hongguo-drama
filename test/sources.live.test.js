@@ -73,3 +73,26 @@ test('playback: direct URL and decrypted blob', async () => {
   assert.equal(again.src, enc.src);
   release(s.episodes[9].vid);
 });
+
+test('playback: prefetch hands off to the player and cancels when abandoned', async () => {
+  const { resolvePlayback, prefetch, release } = await import('../src/media/playback.js');
+  const { CancelToken } = await import('../src/lib/http.js');
+  const list = await retry(async () => okList(await browseList({ source: 'hongguo', category: 'real-drama' })));
+  const s = await retry(() => fetchSeries(list.results[2].series_id));
+  // Abandoned before anyone plays it: the prefetch gives up.
+  const dropped = new CancelToken();
+  const abandoned = prefetch(s.episodes[10].vid, s.series_id, dropped);
+  dropped.cancel();
+  assert.equal(await abandoned, false);
+  // The player joins an in-flight prefetch; cancelling the prefetch afterwards keeps it going.
+  const token = new CancelToken();
+  const warm = prefetch(s.episodes[9].vid, s.series_id, token);
+  const phases = new Set();
+  const playing = retry(() => resolvePlayback(s.episodes[9].vid, s.series_id, { onProgress: p => phases.add(p) }));
+  token.cancel();
+  const enc = await playing;
+  assert.equal(await warm, true);
+  assert.equal(enc.encrypted, true);
+  assert.ok(phases.has('decrypt'), Array.from(phases).join());
+  release(s.episodes[9].vid);
+});

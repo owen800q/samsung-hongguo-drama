@@ -40,6 +40,7 @@ export const DEFAULT_SETTINGS = {
   playbackRate: 1,
   defaultSource: 'hongguo',
   seekStep: 10,
+  cacheNext: true,
 };
 
 export function getSettings() {
