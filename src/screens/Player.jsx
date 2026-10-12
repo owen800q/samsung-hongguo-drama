@@ -42,6 +42,7 @@ export function Player({ series, index: startIndex, fromStart }) {
   const saveTimer = useRef(0);
   const resumeFrom = useRef(0);
   const prefetched = useRef('');
+  const prefetchToken = useRef(null);
   const skipResume = useRef(!!fromStart);
 
   const episodes = series.episodes;
@@ -97,10 +98,14 @@ export function Player({ series, index: startIndex, fromStart }) {
     resumeFrom.current = skipResume.current ? 0 : saved;
     skipResume.current = false;
     loadedEpisode.current = episode;
-    resolvePlayback(episode.vid, series.series_id, {
+    const resolving = resolvePlayback(episode.vid, series.series_id, {
       cancel: token,
       onProgress: (phase, loaded, total) => { if (!token.cancelled) setProgress({ phase, loaded, total }); },
-    }).then(result => {
+    });
+    // Drop the previous episode's prefetch only after this episode joined it, so a
+    // prefetch of exactly this episode keeps going instead of restarting.
+    cancelPrefetch();
+    resolving.then(result => {
       if (token.cancelled) return;
       handle = result;
       v.src = result.src;
@@ -139,6 +144,7 @@ export function Player({ series, index: startIndex, fromStart }) {
         setScreenSaver(false);
         // Only the first start of an episode flashes the controls; resuming after a seek or buffer does not.
         if (!started.current) { started.current = true; showOsd(); }
+        warmNext();
       }),
       on('pause', () => { if (!v.ended && v.currentTime > 0) { setStatus('paused'); save(); showOsd(true); } setScreenSaver(true); }),
       on('waiting', () => setProgress({ phase: 'buffer' })),
@@ -147,14 +153,6 @@ export function Player({ series, index: startIndex, fromStart }) {
         const buffered = v.buffered && v.buffered.length ? v.buffered.end(v.buffered.length - 1) : 0;
         setTime({ current: v.currentTime, duration: v.duration || 0, buffered });
         const d = v.duration || 0;
-        // Warm up the next episode once this one is well under way.
-        if (d && v.currentTime > d * 0.3 && nextRef.current >= 0) {
-          const next = episodes[nextRef.current];
-          if (next && prefetched.current !== next.vid) {
-            prefetched.current = next.vid;
-            prefetch(next.vid, series.series_id);
-          }
-        }
         if (d && d - v.currentTime < 6 && settings.current.autoNext && nextRef.current >= 0) setUpNext(true);
       }),
       on('ended', () => {
@@ -181,6 +179,7 @@ export function Player({ series, index: startIndex, fromStart }) {
       clearTimeout(seekTimer.current);
       document.removeEventListener('visibilitychange', onHide);
       setScreenSaver(true);
+      cancelPrefetch();
       episodes.forEach(ep => release(ep.vid));
     };
   }, []);
@@ -189,6 +188,23 @@ export function Player({ series, index: startIndex, fromStart }) {
   rateRef.current = rate;
   const nextRef = useRef(nextIndex);
   nextRef.current = nextIndex;
+
+  // ---------- next-episode cache ----------
+  // Starts as soon as playback does, so switching episodes rarely waits on a download.
+  function warmNext() {
+    if (!getSettings().cacheNext || nextRef.current < 0) return;
+    const next = episodes[nextRef.current];
+    if (!next || prefetched.current === next.vid) return;
+    cancelPrefetch();
+    prefetched.current = next.vid;
+    prefetchToken.current = new CancelToken();
+    prefetch(next.vid, series.series_id, prefetchToken.current);
+  }
+  function cancelPrefetch() {
+    if (prefetchToken.current) prefetchToken.current.cancel();
+    prefetchToken.current = null;
+    prefetched.current = '';
+  }
 
   // ---------- actions ----------
   function togglePlay() {

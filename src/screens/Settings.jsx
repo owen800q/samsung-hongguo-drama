@@ -35,6 +35,7 @@ export function Settings() {
         <h2 class="section-title">播放</h2>
         <div class="settings-group" data-focus-group="settings">
           <Row label="自动播放下一集" hint="一集结束后接着播放" value={s.autoNext ? '开' : '关'} autofocus onSelect={() => set({ autoNext: !s.autoNext })} />
+          <Row label="缓存下一集" hint="当前集开始播放就预先缓冲下一集，减少切集等待；会占用网络流量" value={s.cacheNext ? '开' : '关'} onSelect={() => set({ cacheNext: !s.cacheNext })} />
           <Row label="默认播放速度" value={s.playbackRate + '×'} onSelect={() => set({ playbackRate: cycle(RATES, s.playbackRate) })} />
           <Row label="快进 / 快退步长" hint="遥控器左右键每次跳过的秒数" value={s.seekStep + ' 秒'} onSelect={() => set({ seekStep: cycle(STEPS, s.seekStep) })} />
         </div>

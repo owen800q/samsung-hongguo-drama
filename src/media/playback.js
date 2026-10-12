@@ -9,6 +9,9 @@ import { decryptMp4 } from './cenc.js';
 import { canWriteMedia, writeTempMedia } from '../platform/tvfile.js';
 
 const MAX_BLOBS = 2;
+// A prefetch gives up on episodes larger than this, so warming the next episode never
+// holds two oversized buffers on a memory-constrained TV. Playing an episode lifts it.
+const PREFETCH_MAX_BYTES = 48 * 1024 * 1024;
 const blobs = new Map(); // vid -> { url, size, used, meta, dispose }
 const inflight = new Map(); // vid -> { promise, token, users }
 
@@ -46,6 +49,10 @@ async function prepareEncrypted(vid, info, token, onProgress) {
   });
   const data = new Uint8Array(res.data);
   if (token.cancelled) throw new Error('已取消');
+  // A connection cut mid-transfer can still "load"; a truncated file only fails later as a
+  // confusing decrypt or decode error. Compressed responses report the encoded length.
+  const expected = res.header && !res.header('content-encoding') ? Number(res.header('content-length')) || 0 : 0;
+  if (expected && data.length !== expected) throw new Error('片源下载不完整，请重试');
   onProgress && onProgress('decrypt', 0, data.length);
   const clear = await decryptMp4(data, fromHex(info.contentKey), {
     cancel: token, onProgress: (done, total) => onProgress && onProgress('decrypt', done, total),
@@ -95,20 +102,26 @@ export async function resolvePlayback(vid, seriesId, options = {}) {
   if (cached) return result(cached.url, cached.meta, true, vid);
 
   let job = inflight.get(vid);
+  // A job already cancelled (e.g. a prefetch that hit its size cap) is only winding down.
+  if (job && job.token.cancelled) job = null;
   if (!job) {
     const token = new CancelToken();
-    job = { token, users: 0 };
+    job = { token, users: 0, maxBytes: options.prefetch ? PREFETCH_MAX_BYTES : Infinity };
     job.promise = (async () => {
       job.progress && job.progress('fetch', 0, 0);
       const info = await getPlayInfo(vid, seriesId);
       if (token.cancelled) throw new Error('已取消');
       if (!info.contentKey) return { src: info.url, info, encrypted: false };
-      const url = await prepareEncrypted(vid, info, token, (p, l, t) => job.progress && job.progress(p, l, t));
+      const url = await prepareEncrypted(vid, info, token, (p, l, t) => {
+        if (p === 'download' && Math.max(l, t) > job.maxBytes) token.cancel();
+        job.progress && job.progress(p, l, t);
+      });
       return { src: url, info, encrypted: true };
     })().finally(() => { if (inflight.get(vid) === job) inflight.delete(vid); });
     inflight.set(vid, job);
   }
   job.users++;
+  if (!options.prefetch) job.maxBytes = Infinity;
   if (onProgress) job.progress = onProgress;
   let unsubscribe = () => {};
   if (options.cancel) {
@@ -126,7 +139,10 @@ export async function resolvePlayback(vid, seriesId, options = {}) {
   }
 }
 
-/** Warm up the next episode (address lookup, and decryption when needed). Never throws. */
-export function prefetch(vid, seriesId) {
-  return resolvePlayback(vid, seriesId).then(() => true, () => false);
+/**
+ * Warm up the next episode (address lookup, and download + decryption when needed).
+ * Cancelling `cancel` abandons the work unless the player has started using it. Never throws.
+ */
+export function prefetch(vid, seriesId, cancel) {
+  return resolvePlayback(vid, seriesId, { cancel, prefetch: true }).then(() => true, () => false);
 }
