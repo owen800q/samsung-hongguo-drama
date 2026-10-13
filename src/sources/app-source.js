@@ -321,7 +321,9 @@ export async function fetchAppPlayUrl(vid) {
   const outer = await requestJson(fallback, {}, deadline);
   const info = outer && outer.video_info && outer.video_info.data;
   const list = (info && info.video_list) || {};
-  const rows = Object.keys(list).map(k => list[k]).filter(item => item && item.main_url).map(item => {
+  // Samsung TVs decode HEVC in hardware, so resolution still outranks codec here
+  // (the desktop app now prefers H.264 because it may have to transcode HEVC).
+  const rows = Object.keys(list).map(k => list[k]).filter(item => item && (item.main_url || item.backup_url)).map(item => {
     const meta = item.video_meta || {};
     const codec = str(item.codec_type || meta.codec_type).toLowerCase();
     const codecRank = ['h264', 'avc', 'avc1'].indexOf(codec) >= 0 ? 0 : ['hevc', 'h265', 'hvc1', 'hev1', 'bytevc1'].indexOf(codec) >= 0 ? 1 : 2;
@@ -329,13 +331,24 @@ export async function fetchAppPlayUrl(vid) {
     const pm = quality.match(/\d+/);
     return { item, codec, codecRank, quality, pixels: Number(pm ? pm[0] : 0) };
   }).filter(row => row.codecRank < 2).sort((a, b) => b.pixels - a.pixels || a.codecRank - b.codecRank);
-  const selected = rows[0];
-  if (!selected) throw new Error('本集暂未提供兼容的 H.264/HEVC 片源');
-  const media = info.key_seed ? decryptSpadeUrl(selected.item.main_url, fromBase64(info.key_seed)) : cleanUrl(selected.item.main_url);
-  const url = checkedUrl(media, ['qznovelvod.com', 'fqnovelvod.com', 'douyinvod.com']);
-  const spade = selected.item.spade_a || (selected.item.encrypt_info && selected.item.encrypt_info.spade_a);
-  return {
-    url, contentKey: spade ? deriveContentKey(spade) : null,
-    codec: selected.codec === 'bytevc1' ? 'hevc' : selected.codec, quality: selected.quality, source: 'app',
-  };
+  if (!rows.length) throw new Error('本集暂未提供兼容的 H.264/HEVC 片源');
+  // A stream whose main address is malformed may still carry a valid backup address;
+  // failing that, fall back to the next stream.
+  let lastError = null;
+  for (let r = 0; r < rows.length; r++) {
+    const selected = rows[r];
+    for (const candidate of [selected.item.main_url, selected.item.backup_url]) {
+      if (!candidate) continue;
+      try {
+        const media = info.key_seed ? decryptSpadeUrl(candidate, fromBase64(info.key_seed)) : cleanUrl(candidate);
+        const url = checkedUrl(media, ['qznovelvod.com', 'fqnovelvod.com', 'douyinvod.com']);
+        const spade = selected.item.spade_a || (selected.item.encrypt_info && selected.item.encrypt_info.spade_a);
+        return {
+          url, contentKey: spade ? deriveContentKey(spade) : null,
+          codec: selected.codec === 'bytevc1' ? 'hevc' : selected.codec, quality: selected.quality, source: 'app',
+        };
+      } catch (error) { lastError = error; }
+    }
+  }
+  throw lastError || new Error('本集暂未提供有效片源地址');
 }

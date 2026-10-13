@@ -71,6 +71,10 @@ test('playback: direct URL and decrypted blob', async () => {
   assert.ok(phases.has('decrypt'), Array.from(phases).join()); // Node transport reports no download progress
   const again = await resolvePlayback(s.episodes[9].vid, s.series_id);
   assert.equal(again.src, enc.src);
+  // Reconnecting drops the cached episode and fetches it again.
+  const fresh = await retry(() => resolvePlayback(s.episodes[9].vid, s.series_id, { force: true }));
+  assert.equal(fresh.encrypted, true);
+  assert.notEqual(fresh.src, enc.src);
   release(s.episodes[9].vid);
 });
 

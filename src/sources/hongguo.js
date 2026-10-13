@@ -100,8 +100,9 @@ async function fetchPlayInfoFresh(vid, sid) {
   throw new Error('红果官网与备用接口均未提供播放地址，请稍后重试');
 }
 
-export function fetchPlayInfo(vid, sid) {
-  return playCache('play:' + (sid || '') + ':' + vid, () => fetchPlayInfoFresh(String(vid), sid ? String(sid) : ''));
+/** `options.force` looks the address up again instead of reusing a recent one. */
+export function fetchPlayInfo(vid, sid, options = {}) {
+  return playCache('play:' + (sid || '') + ':' + vid, () => fetchPlayInfoFresh(String(vid), sid ? String(sid) : ''), options.force);
 }
 
 /** Numeric series id, a hongguoduanju.com URL, or share text containing a link → series id. */
