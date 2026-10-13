@@ -32,7 +32,7 @@ const PROCESS_NONCE = toBase64(randomBytes(18), true);
 const PROCESS_STARTED = Date.now();
 const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
 const DEVICE = {
-  iid: localId(), device_id: localId(), ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
+  ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
   version_code: '71332', version_name: '7.1.3.32', device_platform: 'android', os: 'android',
   ssmix: 'a', device_type: '25053RT47C', device_brand: 'Redmi', language: 'zh', os_api: '36',
   os_version: '16', manifest_version_code: '71332', resolution: '1280*2772', dpi: '520',
@@ -185,14 +185,14 @@ class AesV3 {
 }
 function xmxor(data, key) { const encoded = new Uint8Array(data.length); for (let i = 0; i < data.length; i += 1) { const at = (i * 4) & 28; const d0 = key[at], d1 = key[at + 1]; let d2 = ((((data[i] << 4) | (data[i] >>> 4)) & 255) + d0); d2 = (~d2) ^ d1; d2 = ((((d2 & 255) << 3) | ((d2 & 255) >>> 5)) & 255); d2 = (d2 + d1) & 255; d2 = (d2 ^ d0) & 255; encoded[data.length - i - 1] = (~d2) & 255; } const last = encoded[encoded.length - 1] ^ encoded[encoded.length - 2]; const first = encoded[0]; encoded[0] = (~last + first) & 255; encoded[1] = ((encoded[0] ^ encoded[encoded.length - 1] ^ 254) + encoded[1]) & 255; encoded[2] = (encoded[2] + ((last - first) ^ (((encoded[1] << 3) | (encoded[1] >>> 5)) & 255) ^ 2)) & 255; for (let i = 0; i < encoded.length - 4; i += 1) { const temp = (((encoded[i + 2] << 3) | (encoded[i + 2] >>> 5)) & 255) ^ encoded[i + 1] ^ (i + 3); encoded[i + 3] = (~temp + encoded[i + 3]) & 255; } encoded[encoded.length - 1] ^= encoded[encoded.length - 2]; let sum = 0; for (let i = 0; i < encoded.length - 1; i += 1) sum += encoded[i + 1]; encoded[0] = ((encoded[0] ^ encoded[1]) + sum) & 255; return encoded; }
 function keyHash(signKey, random) { const input = concat([signKey, le32(random), signKey]); const hash = sm3(input); const d1 = (random >> 16) & 255; let d2 = ((d1 << 11) | (random >>> 24)) ^ (d1 >> 5) ^ d1; d2 = (~d2) >>> 0; return [hash, le32(d2)]; }
-function buildMedusa(url, body, khronos) {
+function buildMedusa(url, body, khronos, device) {
   const query = url.split('?')[1];
   const bodyMd5 = body ? md5Bytes(body) : zeros(16); const querySm3 = sm3(query); const ts = le32(khronos); const queryBodyTs = hashF13(querySm3, bodyMd5, ts, khronos);
   const nested = proto([[1, 111, 'sint'], [2, 10, 'sint'], [3, 694367, 'sint'], [5, 586952199, 'sint']]);
   const messageRand = Math.floor(Math.random() * 0x100000000); const envLaunch = Math.floor(Math.random() * 21) + 100; const envPid = Math.floor(Math.random() * 2000) + 10001;
-  const env = proto([[1, envLaunch, 'sint'], [2, 146331399, 'sint'], [3, 146331396, 'sint'], [5, 7, 'sint'], [6, 'v04.06.04.03-bugfix'], [7, envPid, 'sint'], [12, deviceProto(DEVICE.device_id), 'message'], [13, proto([[1, Math.floor(Date.now() / 1000), 'sint'], [2, -2, 'sint'], [4, 200, 'sint']]), 'message'], [14, DEVICE.version_name]]);
+  const env = proto([[1, envLaunch, 'sint'], [2, 146331399, 'sint'], [3, 146331396, 'sint'], [5, 7, 'sint'], [6, 'v04.06.04.03-bugfix'], [7, envPid, 'sint'], [12, deviceProto(device.device_id), 'message'], [13, proto([[1, Math.floor(Date.now() / 1000), 'sint'], [2, -2, 'sint'], [4, 200, 'sint']]), 'message'], [14, device.version_name]]);
   const queryHash = sm3(concat([utf8(query), bodyMd5, utf8('none')]));
-  const message = proto([[1, fromHex('f7e85ffad7d7dc3bd62ac87057cf6118'), 'bytes'], [2, 3, 'sint'], [3, messageRand, 'sint'], [4, '8662'], [5, DEVICE.device_id], [6, '1588093228'], [7, DEVICE.version_name], [8, 'v04.06.04-ml-android'], [9, 67503104, 'sint'], [10, fromHex('4001000000000000'), 'bytes'], [12, khronos, 'sint'], [13, queryBodyTs, 'bytes'], [14, querySm3.subarray(0, 6), 'bytes'], [15, nested, 'message'], [16, PROCESS_NONCE], [17, khronos, 'sint'], [19, queryHash, 'bytes'], [20, 'none'], [21, 312, 'sint'], [23, env, 'message'], [24, '{"cmr":16777216,"cmr2":16777216,"un_h":1879194040,"vpn":0,"kd":0,"fkd":3672518972,"pd":-1872573247,"dyn":"","do":0,"tk":true}']]);
+  const message = proto([[1, fromHex('f7e85ffad7d7dc3bd62ac87057cf6118'), 'bytes'], [2, 3, 'sint'], [3, messageRand, 'sint'], [4, '8662'], [5, device.device_id], [6, '1588093228'], [7, device.version_name], [8, 'v04.06.04-ml-android'], [9, 67503104, 'sint'], [10, fromHex('4001000000000000'), 'bytes'], [12, khronos, 'sint'], [13, queryBodyTs, 'bytes'], [14, querySm3.subarray(0, 6), 'bytes'], [15, nested, 'message'], [16, PROCESS_NONCE], [17, khronos, 'sint'], [19, queryHash, 'bytes'], [20, 'none'], [21, 312, 'sint'], [23, env, 'message'], [24, '{"cmr":16777216,"cmr2":16777216,"un_h":1879194040,"vpn":0,"kd":0,"fkd":3672518972,"pd":-1872573247,"dyn":"","do":0,"tk":true}']]);
   const random = Math.floor(Math.random() * 0x100000000);
   const kh = keyHash(fromHex('8ebdfa3806ecc5cee79423e6029ed82540bc2218bb7eaef71cb691f7aa8aa2f5'), random);
   const hash = kh[0], seed = kh[1];
@@ -224,16 +224,19 @@ function helios(khronos) {
 }
 function branchOf(url, body, khronos) { const bodyMd5 = body ? md5Bytes(body) : zeros(16); const q = sm3(url.split('?')[1]); const iv = getIv(getIv(getIv(0x20230928, q), bodyMd5), le32(khronos)); const low = iv & 15; return low - (((low * 171) >> 9) * 3); }
 function signedVideoRequest(payload) {
+  // Fresh synthetic IDs per request, shared by URL and signature: the server rejects
+  // (code 110001) repeat requests from one fake device after the first.
+  const device = Object.assign({}, DEVICE, { iid: localId(), device_id: localId() });
   const khronos = Math.floor(Date.now() / 1000); const body = utf8(payload); const ticketBase = Date.now(); let requestTicket = ticketBase; let query = ''; let url = '';
   // The server rejects branch-1 signatures: jitter _rticket until another branch is chosen.
-  for (let offset = 0; offset < 32; offset += 1) { requestTicket = ticketBase + offset; const values = Object.assign({}, DEVICE, { ts: String(khronos), _rticket: String(requestTicket) }); query = pythonUrlEncode(values); url = VIDEO_API + '?' + query; if (branchOf(url, body, khronos) !== 1) break; }
+  for (let offset = 0; offset < 32; offset += 1) { requestTicket = ticketBase + offset; const values = Object.assign({}, device, { ts: String(khronos), _rticket: String(requestTicket) }); query = pythonUrlEncode(values); url = VIDEO_API + '?' + query; if (branchOf(url, body, khronos) !== 1) break; }
   const random = Math.floor(Math.random() * 65536);
   const headers = {
     Accept: 'application/json; charset=utf-8,application/x-protobuf', 'Content-Type': 'application/json; charset=UTF-8',
     'x-xs-from-web': '0', 'x-ss-req-ticket': String(requestTicket), 'x-tt-request-tag': 't=0;n=0', 'sdk-version': '2', 'passport-sdk-version': '50561',
     'x-vc-bdturing-sdk-version': '3.7.2.cn', 'x-ss-stub': md5Hex(body), 'x-gorgon': xGorgon(query, body, khronos, random),
     'x-khronos': String(khronos), 'x-ladon': toBase64(be32(khronos)), 'x-argus': toBase64(le32(khronos)),
-    'x-helios': helios(khronos), 'x-medusa': buildMedusa(url, body, khronos), 'x-tt-dt': '',
+    'x-helios': helios(khronos), 'x-medusa': buildMedusa(url, body, khronos, device), 'x-tt-dt': '',
   };
   return { url, headers, body };
 }
