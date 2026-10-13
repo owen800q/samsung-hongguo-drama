@@ -12,9 +12,9 @@ const RATES = [0.75, 1, 1.25, 1.5, 2];
 const OSD_TIMEOUT = 5000;
 const SEEK_COMMIT_MS = 650;
 
-function phaseLabel(p) {
+function phaseLabel(p, reconnecting) {
   if (!p) return '正在准备…';
-  if (p.phase === 'fetch') return '正在获取播放地址…';
+  if (p.phase === 'fetch') return reconnecting ? '正在重新获取本集片源…' : '正在获取播放地址…';
   if (p.phase === 'download') return p.total ? '正在缓冲片源 ' + Math.floor(p.loaded / p.total * 100) + '%' : '正在缓冲片源…';
   if (p.phase === 'decrypt' || p.phase === 'store') return '正在处理片源…';
   if (p.phase === 'buffer') return '正在缓冲…';
@@ -35,6 +35,9 @@ export function Player({ series, index: startIndex, fromStart }) {
   const [rate, setRate] = useState(settings.current.playbackRate || 1);
   const [seekTarget, setSeekTarget] = useState(null);
   const [upNext, setUpNext] = useState(false);
+  // Bumped to reload the current episode with a fresh address (retry / reconnect).
+  const [reload, setReload] = useState(0);
+  const [reconnecting, setReconnecting] = useState(false);
   const osdTimer = useRef(0);
   const seekTimer = useRef(0);
   const seekRef = useRef(null);
@@ -44,6 +47,8 @@ export function Player({ series, index: startIndex, fromStart }) {
   const prefetched = useRef('');
   const prefetchToken = useRef(null);
   const skipResume = useRef(!!fromStart);
+  const pendingReload = useRef(null); // { position } for the next load
+  const autoReconnected = useRef(-1); // episode index already reconnected automatically
 
   const episodes = series.episodes;
   const episode = episodes[index];
@@ -93,13 +98,18 @@ export function Player({ series, index: startIndex, fromStart }) {
     started.current = false;
     clearTimeout(seekTimer.current);
     showOsd(true);
+    const reloadRequest = pendingReload.current;
+    pendingReload.current = null;
+    setReconnecting(!!reloadRequest);
+    if (!reloadRequest) autoReconnected.current = -1;
     const history = getHistoryEntry(series.series_id);
     const saved = history && history.positions ? Number(history.positions[episode.vid]) || 0 : 0;
-    resumeFrom.current = skipResume.current ? 0 : saved;
+    resumeFrom.current = reloadRequest ? reloadRequest.position : skipResume.current ? 0 : saved;
     skipResume.current = false;
     loadedEpisode.current = episode;
     const resolving = resolvePlayback(episode.vid, series.series_id, {
       cancel: token,
+      force: !!reloadRequest,
       onProgress: (phase, loaded, total) => { if (!token.cancelled) setProgress({ phase, loaded, total }); },
     });
     // Drop the previous episode's prefetch only after this episode joined it, so a
@@ -115,6 +125,8 @@ export function Player({ series, index: startIndex, fromStart }) {
       if (p && p.catch) p.catch(() => {});
     }).catch(e => {
       if (token.cancelled) return;
+      // A dropped connection or an expired address gets one automatic reconnect.
+      if ((e && e.status === 0) || /下载不完整|错误页面/.test(e && e.message)) { if (reconnect(true)) return; }
       setStatus('error');
       setError(errorMessage(e, '这一集暂时无法播放'));
       showOsd(true);
@@ -126,7 +138,7 @@ export function Player({ series, index: startIndex, fromStart }) {
       try { v.pause(); v.removeAttribute('src'); v.load(); } catch (_) {}
       if (handle && handle.revoke) handle.revoke();
     };
-  }, [index]);
+  }, [index, reload]);
 
   // ---------- video events ----------
   useEffect(() => {
@@ -164,6 +176,7 @@ export function Player({ series, index: startIndex, fromStart }) {
       on('error', () => {
         if (!v.getAttribute('src')) return;
         const code = v.error && v.error.code;
+        if (code === 2 && reconnect(true)) return;
         setStatus('error');
         setError(code === 4 ? '电视无法解码这一集的片源格式' : code === 2 ? '网络中断，片源没有加载完成' : '播放出错了，请重试');
         showOsd(true);
@@ -188,6 +201,8 @@ export function Player({ series, index: startIndex, fromStart }) {
   rateRef.current = rate;
   const nextRef = useRef(nextIndex);
   nextRef.current = nextIndex;
+  const indexRef = useRef(index);
+  indexRef.current = index;
 
   // ---------- next-episode cache ----------
   // Starts as soon as playback does, so switching episodes rarely waits on a download.
@@ -232,6 +247,20 @@ export function Player({ series, index: startIndex, fromStart }) {
       seekRef.current = null;
       setSeekTarget(null);
     }, SEEK_COMMIT_MS);
+  }
+
+  /**
+   * Reload the current episode with a freshly looked-up address, keeping the position.
+   * Automatic reconnects happen at most once per episode; a manual retry re-arms that.
+   */
+  function reconnect(auto) {
+    const i = indexRef.current;
+    if (auto && autoReconnected.current === i) return false;
+    autoReconnected.current = auto ? i : -1;
+    const v = video.current;
+    pendingReload.current = { position: v && v.currentTime > 0 ? v.currentTime : resumeFrom.current };
+    setReload(n => n + 1);
+    return true;
   }
 
   function go(i) {
@@ -329,7 +358,7 @@ export function Player({ series, index: startIndex, fromStart }) {
       {busy && status !== 'error' && (
         <div class="player-loading">
           <span class="spinner spinner-lg" />
-          <span>{phaseLabel(progress)}</span>
+          <span>{phaseLabel(progress, reconnecting)}</span>
         </div>
       )}
 
@@ -346,7 +375,7 @@ export function Player({ series, index: startIndex, fromStart }) {
           <div class="player-error-text">{error}</div>
           <div class="player-error-actions">
             <button type="button" tabIndex={-1} class="btn btn-primary focusable" data-autofocus
-              onClick={() => { const i = index; setIndex(-1); setTimeout(() => setIndex(i), 0); }}>重试</button>
+              onClick={() => reconnect(false)}>重试</button>
             {nextIndex >= 0 && <button type="button" tabIndex={-1} class="btn focusable" onClick={() => go(nextIndex)}>播放下一集</button>}
             <button type="button" tabIndex={-1} class="btn focusable" onClick={() => router.back()}>返回详情</button>
           </div>

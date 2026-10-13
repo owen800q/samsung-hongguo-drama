@@ -14,6 +14,7 @@ const MAX_BLOBS = 2;
 const PREFETCH_MAX_BYTES = 48 * 1024 * 1024;
 const blobs = new Map(); // vid -> { url, size, used, meta, dispose }
 const inflight = new Map(); // vid -> { promise, token, users }
+let fileSeq = 0;
 
 function touchBlob(vid) {
   const entry = blobs.get(vid);
@@ -49,10 +50,13 @@ async function prepareEncrypted(vid, info, token, onProgress) {
   });
   const data = new Uint8Array(res.data);
   if (token.cancelled) throw new Error('已取消');
+  // An expired address can answer 200 with an error page instead of the video.
+  const type = res.header ? res.header('content-type') || '' : '';
+  if (/text\/html|application\/json/i.test(type)) throw new Error('片源返回了错误页面，请重新获取片源');
   // A connection cut mid-transfer can still "load"; a truncated file only fails later as a
   // confusing decrypt or decode error. Compressed responses report the encoded length.
   const expected = res.header && !res.header('content-encoding') ? Number(res.header('content-length')) || 0 : 0;
-  if (expected && data.length !== expected) throw new Error('片源下载不完整，请重试');
+  if (!data.length || (expected && data.length !== expected)) throw new Error('片源下载不完整，请重试');
   onProgress && onProgress('decrypt', 0, data.length);
   const clear = await decryptMp4(data, fromHex(info.contentKey), {
     cancel: token, onProgress: (done, total) => onProgress && onProgress('decrypt', done, total),
@@ -63,7 +67,8 @@ async function prepareEncrypted(vid, info, token, onProgress) {
   if (canWriteMedia()) {
     onProgress && onProgress('store', 0, clear.length);
     // A blob is the fallback (e.g. the web simulator's mocked filesystem, or a full disk).
-    try { file = await writeTempMedia('ep-' + vid.replace(/[^0-9A-Za-z]/g, '_') + '.mp4', clear); } catch (_) {}
+    // Unique per write, so an abandoned job cleaning up never deletes a newer job's file.
+    try { file = await writeTempMedia('ep-' + vid.replace(/[^0-9A-Za-z]/g, '_') + '-' + (++fileSeq) + '.mp4', clear); } catch (_) {}
   }
   if (file) {
     url = file.uri;
@@ -73,6 +78,7 @@ async function prepareEncrypted(vid, info, token, onProgress) {
     dispose = () => URL.revokeObjectURL(url);
   }
   if (token.cancelled) { dispose(); throw new Error('已取消'); }
+  release(vid);
   blobs.set(vid, { url, size: clear.length, used: Date.now(), meta: info, dispose });
   evict(vid);
   return url;
@@ -92,24 +98,30 @@ function result(src, info, encrypted, vid) {
 }
 
 /**
- * resolvePlayback(vid, seriesId, { cancel, onProgress(phase, loaded, total) })
+ * resolvePlayback(vid, seriesId, { cancel, onProgress(phase, loaded, total), force })
  * phase: 'fetch' (address lookup), 'download', 'decrypt'.
+ * `force` reconnects: it drops the cached episode and any in-flight work, and looks the
+ * address up again.
  */
 export async function resolvePlayback(vid, seriesId, options = {}) {
   vid = String(vid);
   const onProgress = options.onProgress;
+  const force = !!options.force;
+  if (force) release(vid);
   const cached = touchBlob(vid);
   if (cached) return result(cached.url, cached.meta, true, vid);
 
   let job = inflight.get(vid);
+  // Reconnecting abandons work that was started with the old address.
+  if (job && force && !job.force) job.token.cancel();
   // A job already cancelled (e.g. a prefetch that hit its size cap) is only winding down.
   if (job && job.token.cancelled) job = null;
   if (!job) {
     const token = new CancelToken();
-    job = { token, users: 0, maxBytes: options.prefetch ? PREFETCH_MAX_BYTES : Infinity };
+    job = { token, users: 0, force, maxBytes: options.prefetch ? PREFETCH_MAX_BYTES : Infinity };
     job.promise = (async () => {
       job.progress && job.progress('fetch', 0, 0);
-      const info = await getPlayInfo(vid, seriesId);
+      const info = await getPlayInfo(vid, seriesId, { force });
       if (token.cancelled) throw new Error('已取消');
       if (!info.contentKey) return { src: info.url, info, encrypted: false };
       const url = await prepareEncrypted(vid, info, token, (p, l, t) => {

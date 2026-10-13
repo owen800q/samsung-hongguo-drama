@@ -101,7 +101,11 @@ export function withQuery(url, params) {
   return pairs.length ? url + (url.indexOf('?') >= 0 ? '&' : '?') + pairs.join('&') : url;
 }
 
-/** Short-lived memo: identical in-flight requests share one promise; failures are not cached. */
+/**
+ * Short-lived memo: identical in-flight requests share one promise; failures are not cached.
+ * `force` skips both the cache and any in-flight request, and the forced request then owns
+ * the key: an older request finishing later cannot overwrite its result.
+ */
 export function memo(ttl, maxSize = 64) {
   const cache = new Map();
   const pending = new Map();
@@ -109,12 +113,14 @@ export function memo(ttl, maxSize = 64) {
     const hit = cache.get(key);
     if (!force && hit && hit.expires > Date.now()) return Promise.resolve(hit.value);
     cache.delete(key);
-    if (pending.has(key)) return pending.get(key);
+    if (!force && pending.has(key)) return pending.get(key);
     const p = Promise.resolve().then(load).then(value => {
-      cache.set(key, { value, expires: Date.now() + ttl });
-      if (cache.size > maxSize) cache.delete(cache.keys().next().value);
+      if (pending.get(key) === p) {
+        cache.set(key, { value, expires: Date.now() + ttl });
+        if (cache.size > maxSize) cache.delete(cache.keys().next().value);
+      }
       return value;
-    }).finally(() => pending.delete(key));
+    }).finally(() => { if (pending.get(key) === p) pending.delete(key); });
     pending.set(key, p);
     return p;
   };

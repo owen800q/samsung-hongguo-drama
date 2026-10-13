@@ -118,9 +118,10 @@ export async function fetchSeries(seriesId, options = {}) {
   };
 }
 
-export async function getPlayInfo(vid, seriesId) {
+/** `options.force` bypasses cached addresses (西饭 and 河马 never cache them). */
+export async function getPlayInfo(vid, seriesId, options = {}) {
   const source = sourceOf(seriesId || vid);
-  const info = await ADAPTERS[source].fetchPlayInfo(String(vid), seriesId ? String(seriesId) : '');
+  const info = await ADAPTERS[source].fetchPlayInfo(String(vid), seriesId ? String(seriesId) : '', options);
   if (!info || !info.url) throw new Error('未获取到有效播放地址');
   return info;
 }
