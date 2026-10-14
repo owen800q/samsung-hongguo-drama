@@ -126,6 +126,11 @@ export async function getPlayInfo(vid, seriesId, options = {}) {
   return info;
 }
 
+/** A 红果 website address failed to play: prefer the App source for it for a while. */
+export function markWebMediaFailure(vid, seriesId) {
+  if (sourceOf(seriesId || vid) === 'hongguo') hongguo.markWebMediaFailure(String(vid));
+}
+
 /** Resolve a typed series id or share link to a 红果 series id. */
 export function resolveSeriesId(input) {
   return hongguo.resolveSeriesId(input);

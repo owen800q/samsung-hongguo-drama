@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { useRouter, useKeys } from '../router.js';
 import { resolvePlayback, prefetch, release } from '../media/playback.js';
+import { markWebMediaFailure } from '../sources/index.js';
 import { CancelToken } from '../lib/http.js';
 import { getHistoryEntry, getSettings, recordProgress, saveSettings } from '../lib/storage.js';
 import { errorMessage, formatTime } from '../lib/format.js';
@@ -75,6 +76,8 @@ export function Player({ series, index: startIndex, fromStart }) {
   // ---------- progress persistence ----------
   // The episode whose media is in the <video> right now (null while switching).
   const loadedEpisode = useRef(null);
+  // Where that media came from ('web' is the 红果 website's CDN).
+  const loadedSource = useRef('');
   function save() {
     const v = video.current;
     const ep = loadedEpisode.current;
@@ -107,6 +110,7 @@ export function Player({ series, index: startIndex, fromStart }) {
     resumeFrom.current = reloadRequest ? reloadRequest.position : skipResume.current ? 0 : saved;
     skipResume.current = false;
     loadedEpisode.current = episode;
+    loadedSource.current = '';
     const resolving = resolvePlayback(episode.vid, series.series_id, {
       cancel: token,
       force: !!reloadRequest,
@@ -118,6 +122,7 @@ export function Player({ series, index: startIndex, fromStart }) {
     resolving.then(result => {
       if (token.cancelled) return;
       handle = result;
+      loadedSource.current = result.source;
       v.src = result.src;
       v.playbackRate = rate;
       v.load();
@@ -176,9 +181,14 @@ export function Player({ series, index: startIndex, fromStart }) {
       on('error', () => {
         if (!v.getAttribute('src')) return;
         const code = v.error && v.error.code;
-        if (code === 2 && reconnect(true)) return;
+        // An unavailable HTTP stream is also reported as an unsupported source (4). The
+        // reconnect then tries the App source first, with the website as a last resort.
+        const webUnavailable = loadedSource.current === 'web' && (code === 2 || code === 4);
+        if (webUnavailable && loadedEpisode.current) markWebMediaFailure(loadedEpisode.current.vid, series.series_id);
+        if ((code === 2 || webUnavailable) && reconnect(true)) return;
         setStatus('error');
-        setError(code === 4 ? '电视无法解码这一集的片源格式' : code === 2 ? '网络中断，片源没有加载完成' : '播放出错了，请重试');
+        setError(webUnavailable && code === 4 ? '片源暂时无法播放，请重试'
+          : code === 4 ? '电视无法解码这一集的片源格式' : code === 2 ? '网络中断，片源没有加载完成' : '播放出错了，请重试');
         showOsd(true);
       }),
     ];
