@@ -62,23 +62,75 @@ export function fetchEpisodeList(seriesId, options = {}) {
   return episodesCache('episodes:' + seriesId, () => fetchEpisodeListFromWeb(String(seriesId)), options.force);
 }
 
+/**
+ * The clear MP4 of exactly this episode from a player page, or ''. The page also lists
+ * recommended videos, so the address must come from the VideoObject bound to this
+ * player, and the page model must confirm the episode is publicly playable.
+ */
+export function pickWebMedia(html, vid, sid) {
+  let data;
+  try { data = (readRouterData(html).loaderData || {})['player_(series_id)/(vid)/page']; } catch (_) { return ''; }
+  const actualSid = String((data && data.series_id) || '');
+  const seo = data && data.publicVideoSeo;
+  if (!data || data.isSuccess === false || String(data.vid) !== String(vid) || !/^\d+$/.test(actualSid) ||
+      (sid && actualSid !== String(sid)) || String(data.seriesDetail && data.seriesDetail.series_id) !== actualSid ||
+      !seo || seo.available !== true || String(seo.itemId) !== String(vid) || String(seo.seriesId) !== actualSid) return '';
+  const matchesPlayer = value => {
+    try {
+      const target = new URL(value);
+      // The first episode's page names the series URL as its canonical address.
+      return target.origin === SITE && !target.username && !target.password &&
+        (target.pathname === '/player/' + actualSid + '/' + String(vid) || target.pathname === '/player/' + actualSid);
+    } catch (_) { return false; }
+  };
+  const scripts = /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi;
+  let m;
+  while ((m = scripts.exec(html))) {
+    if (!/\btype\s*=\s*["']application\/ld\+json["']/i.test(m[1])) continue;
+    let video;
+    try { video = JSON.parse(m[2]); } catch (_) { continue; }
+    if (!video || video['@type'] !== 'VideoObject' || !matchesPlayer(video.url) ||
+        (video['@id'] && !matchesPlayer(video['@id']))) continue;
+    const url = mediaUrl(normalizeVideoUrl(video.contentUrl));
+    if (url) return url;
+  }
+  return '';
+}
+
+function mediaUrl(value) {
+  try {
+    const url = new URL(value);
+    return /^https?:$/.test(url.protocol) && !url.username && !url.password ? url.href : '';
+  } catch (_) { return ''; }
+}
+
 async function fetchPlayUrlFromWeb(vid, sid) {
   const candidates = [];
   if (sid) candidates.push(SITE + '/player/' + encodeURIComponent(sid) + '/' + encodeURIComponent(vid));
   candidates.push(SITE + '/player/_/' + encodeURIComponent(vid));
   for (const url of candidates) {
     try {
-      const html = await fetchSiteHtml(url);
-      const m = html.match(/"main_url"\s*:\s*"([^"]+)"/) || html.match(/"contentUrl"\s*:\s*"([^"]+)"/);
-      if (!m) continue;
-      const videoUrl = normalizeVideoUrl(m[1]);
-      if (/^https?:\/\//i.test(videoUrl)) return { url: videoUrl, contentKey: null, codec: '', quality: '', source: 'web' };
+      const videoUrl = pickWebMedia(await fetchSiteHtml(url), vid, sid);
+      if (videoUrl) return { url: videoUrl, contentKey: null, codec: '', quality: '', source: 'web', vid: String(vid) };
     } catch (_) { /* try the next form, then the App source */ }
   }
   return null;
 }
 
-async function fetchPlayInfoFresh(vid, sid) {
+// Episodes whose website CDN address just failed to load, until when (ms).
+const failedWebMedia = new Map();
+
+/**
+ * The website's media address for `vid` failed to play. For a few minutes, lookups prefer
+ * the App source, keeping the website only as a last resort.
+ */
+export function markWebMediaFailure(vid) {
+  failedWebMedia.delete(String(vid));
+  failedWebMedia.set(String(vid), Date.now() + 5 * 60 * 1000);
+  if (failedWebMedia.size > 128) failedWebMedia.delete(failedWebMedia.keys().next().value);
+}
+
+async function fetchPlayInfoFresh(vid, sid, skipWeb) {
   // Only trust the web page for episodes inside the web-accessible range; past it the
   // page may embed a preview of another episode.
   let series = null;
@@ -86,13 +138,18 @@ async function fetchPlayInfoFresh(vid, sid) {
   const index = series ? series.episodes.findIndex(e => e.vid === String(vid)) : -1;
   const accessible = series ? series.web_accessible_episodes : null;
   const inWebRange = !(typeof accessible === 'number' && index >= accessible);
-  if (inWebRange) {
+  if (inWebRange && !skipWeb) {
     const web = await fetchPlayUrlFromWeb(vid, sid);
     if (web) return web;
   }
   try {
     return await fetchAppPlayUrl(String(vid));
   } catch (_) { /* fall through to an explanatory error */ }
+  // A CDN hiccup changes the order of the sources, not whether the website has the episode.
+  if (inWebRange && skipWeb) {
+    const web = await fetchPlayUrlFromWeb(vid, sid);
+    if (web) return web;
+  }
   if (!inWebRange) {
     const range = accessible > 0 ? '仅提供前 ' + accessible + ' 集' : '暂未提供可播放分集';
     throw new Error('红果官网当前' + range + '，第 ' + (index + 1) + ' 集暂时无法获取播放地址，请稍后重试。');
@@ -102,7 +159,9 @@ async function fetchPlayInfoFresh(vid, sid) {
 
 /** `options.force` looks the address up again instead of reusing a recent one. */
 export function fetchPlayInfo(vid, sid, options = {}) {
-  return playCache('play:' + (sid || '') + ':' + vid, () => fetchPlayInfoFresh(String(vid), sid ? String(sid) : ''), options.force);
+  const skipWeb = (failedWebMedia.get(String(vid)) || 0) > Date.now();
+  return playCache('play:' + (sid || '') + ':' + vid + (skipWeb ? ':fallback' : ''),
+    () => fetchPlayInfoFresh(String(vid), sid ? String(sid) : '', skipWeb), options.force);
 }
 
 /** Numeric series id, a hongguoduanju.com URL, or share text containing a link → series id. */
