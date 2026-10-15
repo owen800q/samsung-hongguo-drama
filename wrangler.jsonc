@@ -1,0 +1,9 @@
+// Cloudflare Worker for hongguo.codeboxhk.com, deployed by Workers Builds on push to main.
+// It serves over-the-air updates for the TV app (/tv-app/, see ota/) as static assets.
+// The name must match the Worker connected in the dashboard.
+{
+  "name": "samsung-hongguo-drama",
+  "compatibility_date": "2026-09-10",
+  "build": { "command": "npm ci --no-audit --no-fund && npm run build && node scripts/ota-update.mjs" },
+  "assets": { "directory": "./worker-assets" }
+}

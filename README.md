@@ -45,8 +45,8 @@ npm test           # 加解密单元测试 + 三个来源的在线接口测试
 ## 打包与安装
 
 ```bash
-npm run package                          # 构建并生成 build/*.wgt
-npm run package -- --profile <证书配置名>  # 已安装 Tizen CLI 时直接签名
+npm run package                          # 构建并生成 build/HongguoTV-unsigned.wgt
+npm run package -- --profile <证书配置名>  # 已安装 Tizen CLI 时直接签名，生成 build/HongguoTV.wgt
 ```
 
 电视只安装签过名的 widget：
@@ -55,9 +55,15 @@ npm run package -- --profile <证书配置名>  # 已安装 Tizen CLI 时直接�
 2. 在 Certificate Manager 里用三星证书创建证书配置，把电视的 DUID 加进分发者证书。
 3. 电视进入开发者模式：「应用」页面依次按 `1 2 3 4 5`，打开 Developer mode，填写电脑的 IP，然后重启电视。
 4. 把 `tizen` 加进 PATH，运行 `npm run package -- --profile <配置名>`。
-5. 运行 `sdb connect <电视 IP>`，再运行 `tizen install -n build/<文件名>.wgt -t <设备名>`。
+5. 运行 `sdb connect <电视 IP>`，再运行 `tizen install -n build/HongguoTV.wgt -t <设备名>`。
 
-也可以把 `dist/` 导入 Tizen Studio 的 Web 项目，在 IDE 里签名并运行。
+也可以把 `build/widget/` 导入 Tizen Studio 的 Web 项目，在 IDE 里签名并运行。
+
+### 自动更新
+
+装好的电视会自己更新，不用再用 sdb 重装。Cloudflare Worker `hongguo.codeboxhk.com`（`wrangler.jsonc`，推送到 `main` 时由 Workers Builds 部署）在 `/tv-app/` 发布最新构建（`scripts/ota-update.mjs`）。应用启动后在后台下载新版，下次打开时生效。原理与回退机制见 [ota/README.md](ota/README.md)。
+
+每次推送到 `main` 也会发布一个附带 widget 的 GitHub Release（`.github/workflows/release.yml`）。只有改了 `tizen/config.xml`、图标或加载器时才需要重装。仓库设置了 ota/README.md 列出的证书 Secrets 时，Release 里的 widget 会签好名。
 
 **模拟器**：安装 `TV-SAMSUNG-Public-Emulator` 后运行 `scripts/emulator.sh <证书配置名>`，脚本会创建虚拟机、启动、构建签名并安装运行。三星电视模拟器和真机一样，只接受三星证书：在 Certificate Manager 里创建 Samsung → TV 证书配置，分发者证书选 Public，并把模拟器的 DUID 加进去（模拟器连接时用 `sdb -s <设备> shell 0 getduid` 查看）。普通 Tizen 证书会被拒绝，报错 `Invalid certificate chain`。macOS 上模拟器依赖 Intel HAXM（不支持 Hypervisor.framework），安装 HAXM 后需要重启一次。
 
