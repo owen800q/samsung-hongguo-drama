@@ -38,12 +38,14 @@
 
   if (remote) {
     // A file of the downloaded build that cannot load (cache evicted while offline): start the bundled build instead.
+    // Only the build's own files count, not ones the runtime injects.
     var fellBack = false;
     window.addEventListener('error', function (e) {
       var el = e.target;
       var tag = el && el.tagName;
       var url = tag === 'SCRIPT' ? el.src : tag === 'LINK' ? el.href : '';
       if (fellBack || !url || url.indexOf(run.base) !== 0) return;
+      if (run.files && run.files.indexOf(url.slice(run.base.length).split(/[?#]/)[0]) < 0) return;
       fellBack = true;
       var s = load();
       s.ready = null;
@@ -121,7 +123,9 @@
       (function next() {
         if (i === m.files.length) {
           var s2 = load();
-          s2.ready = { id: m.id, base: base, head: m.head, body: m.body, bodyAttrs: m.bodyAttrs || '' };
+          var paths = [];
+          for (var j = 0; j < m.files.length; j++) paths.push(m.files[j].path);
+          s2.ready = { id: m.id, base: base, head: m.head, body: m.body, bodyAttrs: m.bodyAttrs || '', files: paths };
           s2.tries = 0;
           if (s2.bad === m.id) s2.bad = null;
           if (!save(s2)) return done('error');
