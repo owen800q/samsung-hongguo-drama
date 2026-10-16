@@ -142,14 +142,16 @@ async function fetchPlayInfoFresh(vid, sid, skipWeb) {
     const web = await fetchPlayUrlFromWeb(vid, sid);
     if (web) return web;
   }
+  let appError = null;
   try {
     return await fetchAppPlayUrl(String(vid));
-  } catch (_) { /* fall through to an explanatory error */ }
+  } catch (error) { appError = error; /* fall through to an explanatory error */ }
   // A CDN hiccup changes the order of the sources, not whether the website has the episode.
   if (inWebRange && skipWeb) {
     const web = await fetchPlayUrlFromWeb(vid, sid);
     if (web) return web;
   }
+  if (appError && appError.network) throw new Error('网络连接失败，未能获取播放地址，请检查电视网络后重试');
   if (!inWebRange) {
     const range = accessible > 0 ? '仅提供前 ' + accessible + ' 集' : '暂未提供可播放分集';
     throw new Error('红果官网当前' + range + '，第 ' + (index + 1) + ' 集暂时无法获取播放地址，请稍后重试。');
