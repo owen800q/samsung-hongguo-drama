@@ -3,7 +3,7 @@
 // written to a temp file on the TV (Tizen will not play blob: MP4s) or served from a
 // Blob URL elsewhere. Only a couple of decrypted episodes are kept to bound memory.
 import { getPlayInfo } from '../sources/index.js';
-import { request, CancelToken } from '../lib/http.js';
+import { request, CancelToken, HttpError } from '../lib/http.js';
 import { fromHex } from '../lib/bytes.js';
 import { decryptMp4 } from './cenc.js';
 import { canWriteMedia, writeTempMedia } from '../platform/tvfile.js';
@@ -84,6 +84,27 @@ async function prepareEncrypted(vid, info, token, onProgress) {
   return url;
 }
 
+// A failed download moves on to the episode's next address (a backup, or the next
+// quality down), at most this many in total.
+const MAX_TRANSFERS = 3;
+
+function encryptedCandidates(info) {
+  const list = [info].concat(info.variants || []).filter(v => v && v.url && v.contentKey);
+  const seen = {};
+  return list.filter(v => {
+    const identity = v.url + ':' + v.contentKey;
+    if (seen[identity]) return false;
+    return (seen[identity] = true);
+  }).slice(0, MAX_TRANSFERS);
+}
+
+// Errors from fetching the media itself, where another address may succeed. A timeout
+// usually means a slow network, which another address would not fix.
+function isTransferFailure(error) {
+  if (error instanceof HttpError) return error.status > 0 || error.message === '网络连接失败';
+  return /片源返回了错误页面|片源下载不完整/.test(String(error && error.message));
+}
+
 function result(src, info, encrypted, vid) {
   return {
     src,
@@ -124,11 +145,21 @@ export async function resolvePlayback(vid, seriesId, options = {}) {
       const info = await getPlayInfo(vid, seriesId, { force });
       if (token.cancelled) throw new Error('已取消');
       if (!info.contentKey) return { src: info.url, info, encrypted: false };
-      const url = await prepareEncrypted(vid, info, token, (p, l, t) => {
-        if (p === 'download' && Math.max(l, t) > job.maxBytes) token.cancel();
-        job.progress && job.progress(p, l, t);
-      });
-      return { src: url, info, encrypted: true };
+      const candidates = encryptedCandidates(info);
+      let firstError = null;
+      for (let i = 0; i < candidates.length; i++) {
+        try {
+          const url = await prepareEncrypted(vid, candidates[i], token, (p, l, t) => {
+            if (p === 'download' && Math.max(l, t) > job.maxBytes) token.cancel();
+            job.progress && job.progress(p, l, t);
+          });
+          return { src: url, info: candidates[i], encrypted: true };
+        } catch (error) {
+          if (token.cancelled || !isTransferFailure(error)) throw error;
+          firstError = firstError || error;
+        }
+      }
+      throw firstError;
     })().finally(() => { if (inflight.get(vid) === job) inflight.delete(vid); });
     inflight.set(vid, job);
   }

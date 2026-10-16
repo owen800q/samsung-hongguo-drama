@@ -293,11 +293,15 @@ function checkedUrl(value, domains) {
 async function requestJson(url, options, deadline) {
   url = checkedUrl(url, ['fqnovel.com', 'snssdk.com']);
   const timeout = deadline - Date.now();
-  if (timeout <= 0) throw new Error('App 片源请求超时');
+  if (timeout <= 0) throw Object.assign(new Error('App 片源请求超时'), { network: true });
   let res;
   try {
     res = await request(url, Object.assign({}, options, { responseType: 'text', timeout }));
-  } catch (error) { throw new Error(error && error.status ? 'App 片源请求失败（HTTP ' + error.status + '）' : 'App 片源请求失败，请稍后重试'); }
+  } catch (error) {
+    if (error && error.status > 0) throw new Error('App 片源请求失败（HTTP ' + error.status + '）');
+    // No response at all: the TV's connection, not the source, is the likely cause.
+    throw Object.assign(new Error('App 片源请求失败，请稍后重试'), { network: true });
+  }
   // XHR follows redirects itself; make sure we still ended on an allowed host.
   if (res.url) checkedUrl(res.url, ['fqnovel.com', 'snssdk.com']);
   const parsed = typeof res.data === 'string' ? jsonBody(res.data) : res.data;
@@ -322,11 +326,15 @@ export async function fetchAppPlayUrl(vid) {
   const fallback = parseFallback(model.fallback_api);
   if (!fallback) throw new Error('App 接口未返回本集片源地址');
   const outer = await requestJson(fallback, {}, deadline);
-  const info = outer && outer.video_info && outer.video_info.data;
-  const list = (info && info.video_list) || {};
+  if ([outer, outer.video_info].some(value => Number((value && (value.Code || value.code)) || 0) !== 0)) {
+    throw new Error('App 接口暂未提供本集播放信息');
+  }
+  const info = outer.video_info && outer.video_info.data;
+  if (!info) throw new Error('App 接口未返回本集片源模型');
+  const list = info.video_list || {};
   // Samsung TVs decode HEVC in hardware, so resolution still outranks codec here
   // (the desktop app now prefers H.264 because it may have to transcode HEVC).
-  const rows = Object.keys(list).map(k => list[k]).filter(item => item && (item.main_url || item.backup_url)).map(item => {
+  const rows = Object.keys(list).map(k => list[k]).filter(item => item && (item.main_url || item.backup_url || Array.isArray(item.backup_url_list))).map(item => {
     const meta = item.video_meta || {};
     const codec = str(item.codec_type || meta.codec_type).toLowerCase();
     const codecRank = ['h264', 'avc', 'avc1'].indexOf(codec) >= 0 ? 0 : ['hevc', 'h265', 'hvc1', 'hev1', 'bytevc1'].indexOf(codec) >= 0 ? 1 : 2;
@@ -335,23 +343,34 @@ export async function fetchAppPlayUrl(vid) {
     return { item, codec, codecRank, quality, pixels: Number(pm ? pm[0] : 0) };
   }).filter(row => row.codecRank < 2).sort((a, b) => b.pixels - a.pixels || a.codecRank - b.codecRank);
   if (!rows.length) throw new Error('本集暂未提供兼容的 H.264/HEVC 片源');
-  // A stream whose main address is malformed may still carry a valid backup address;
-  // failing that, fall back to the next stream.
+  // Every usable address, best first: a stream's main address, then its backups, then the
+  // next stream. The player falls back along this list when a download fails.
   let lastError = null;
+  const variants = [];
+  const seen = {};
   for (let r = 0; r < rows.length; r++) {
     const selected = rows[r];
-    for (const candidate of [selected.item.main_url, selected.item.backup_url]) {
-      if (!candidate) continue;
+    const backups = Array.isArray(selected.item.backup_url_list) ? selected.item.backup_url_list : [];
+    let contentKey;
+    for (const candidate of [selected.item.main_url, selected.item.backup_url].concat(backups)) {
+      if (typeof candidate !== 'string' || !candidate) continue;
       try {
         const media = info.key_seed ? decryptSpadeUrl(candidate, fromBase64(info.key_seed)) : cleanUrl(candidate);
         const url = checkedUrl(media, ['qznovelvod.com', 'fqnovelvod.com', 'douyinvod.com']);
-        const spade = selected.item.spade_a || (selected.item.encrypt_info && selected.item.encrypt_info.spade_a);
-        return {
-          url, contentKey: spade ? deriveContentKey(spade) : null,
+        if (contentKey === undefined) {
+          const spade = selected.item.spade_a || (selected.item.encrypt_info && selected.item.encrypt_info.spade_a);
+          contentKey = spade ? deriveContentKey(spade) : null;
+        }
+        const identity = url + ':' + (contentKey || '');
+        if (seen[identity]) continue;
+        seen[identity] = true;
+        variants.push({
+          url, contentKey,
           codec: selected.codec === 'bytevc1' ? 'hevc' : selected.codec, quality: selected.quality, source: 'app',
-        };
+        });
       } catch (error) { lastError = error; }
     }
   }
+  if (variants.length) return Object.assign({}, variants[0], { variants });
   throw lastError || new Error('本集暂未提供有效片源地址');
 }
