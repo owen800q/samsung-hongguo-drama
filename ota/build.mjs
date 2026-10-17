@@ -83,14 +83,15 @@ export const HEADERS = `
 `;
 
 // stage: the widget directory being packaged. origin: the Worker serving updates (null: none).
-// text: the notice shown once an update has been downloaded. preHead: markup the loader
+// text: the notice shown once an update has been downloaded; updated: the notice on the
+// first launch of a downloaded build. preHead: markup the loader
 // keeps before <base>, for paths the runtime resolves itself ($WEBAPIS/…) and per-widget
 // files at the widget root.
-export async function writeWidget({ dir, html, exclude = [], stage, key, origin, text, preHead = '' }) {
+export async function writeWidget({ dir, html, exclude = [], stage, key, origin, text, updated, preHead = '' }) {
   const { id, page, files } = await describe(dir, html, exclude);
   await copyFiles(dir, files, path.join(stage, 'app'));
   const config = {
-    key, id, manifest: origin ? origin.replace(/\/+$/, '') + '/tv-app/manifest.json' : null, text,
+    key, id, manifest: origin ? origin.replace(/\/+$/, '') + '/tv-app/manifest.json' : null, text, updated,
     head: page.head, bodyAttrs: page.bodyAttrs, body: page.body,
   };
   await writeFile(path.join(stage, 'ota-config.js'), 'window.__OTA_CONFIG__ = ' + JSON.stringify(config) + ';\n');

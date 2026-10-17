@@ -13,6 +13,8 @@
   var HEALTHY_AFTER = 5000;       // after load: a launch that lasts this long counts as working
   var MAX_FAILED_LAUNCHES = 3;
   var RETRY_BAD_AFTER = 24 * 3600e3;
+  var NOTICE_FOR = 15000;
+  var UPDATED_NOTICE_AFTER = 1500; // after load, once the app has drawn its first screen
 
   function load() { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { return {}; } }
   function save(s) { try { localStorage.setItem(KEY, JSON.stringify(s)); return true; } catch (e) { return false; } }
@@ -21,6 +23,13 @@
   var bundled = { id: C.id, base: 'app/', head: C.head, body: C.body, bodyAttrs: C.bodyAttrs };
   var run = bundled;
   var ready = state.ready;
+  // Packaged without updates (a proxy baked in): a build downloaded by an earlier install lacks the proxy.
+  if (ready && !C.manifest) {
+    state.ready = null;
+    state.tries = 0;
+    save(state);
+    ready = null;
+  }
   if (ready && ready.id !== C.id && ready.id !== state.bad) {
     // A build that keeps ending its launches early (crash, blank screen) is dropped for the bundled one.
     if ((state.tries || 0) >= MAX_FAILED_LAUNCHES) {
@@ -64,6 +73,16 @@
       if (s.tries) { s.tries = 0; save(s); }
     }, HEALTHY_AFTER);
     setTimeout(auto, CHECK_DELAY);
+    // The first launch of a downloaded build says so once.
+    if (remote && load().shown !== run.id) {
+      setTimeout(function () {
+        if (fellBack) return;
+        var s = load();
+        s.shown = run.id;
+        save(s);
+        toast(C.updated);
+      }, UPDATED_NOTICE_AFTER);
+    }
   });
   document.addEventListener('visibilitychange', function () {
     if (!document.hidden && Date.now() - (load().checked || 0) > RECHECK_AFTER) auto();
@@ -142,13 +161,16 @@
     });
   }
 
+  var shownToast = null;
   function toast(text) {
     if (!text || !document.body) return;
-    var el = document.createElement('div');
+    // A new notice replaces one still on screen instead of stacking over it.
+    if (shownToast && shownToast.parentNode) shownToast.parentNode.removeChild(shownToast);
+    var el = shownToast = document.createElement('div');
     el.textContent = text;
     el.style.cssText = 'position:fixed;right:48px;bottom:48px;z-index:2147483647;padding:16px 28px;border-radius:12px;' +
       'background:rgba(20,20,28,.92);color:#fff;font:28px/1.4 sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.4);pointer-events:none';
     document.body.appendChild(el);
-    setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 6000);
+    setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, NOTICE_FOR);
   }
 })();

@@ -26,7 +26,7 @@ rmSync(out, { recursive: true, force: true });
 mkdirSync(stage, { recursive: true });
 const id = await writeWidget({
   dir: dist, html: readFileSync(join(dist, 'index.html'), 'utf8'), stage,
-  key: 'hongguo', origin, text: '新版本已下载，下次打开时生效',
+  key: 'hongguo', origin, text: '新版本已下载，下次打开时生效', updated: '已更新到新版本',
 });
 // Keep config.xml's version in step with package.json.
 const config = readFileSync(join(root, 'tizen/config.xml'), 'utf8').replace(/(<widget[^>]*\sversion=")[^"]*"/, `$1${version}"`);
