@@ -10,12 +10,14 @@
     "build": "vite build",
     "preview": "vite preview",
     "package": "npm run build && node scripts/package-wgt.js",
-    "test": "node --test test/*.test.js ota/*.test.mjs"
+    "test": "node --test test/*.test.js ota/*.test.mjs",
+    "e2e": "node scripts/e2e-web.mjs"
   },
   "dependencies": {
     "preact": "10.24.3"
   },
   "devDependencies": {
+    "playwright-core": "1.56.1",
     "vite": "5.4.11"
   }
 }
