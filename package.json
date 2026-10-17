@@ -10,7 +10,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "package": "npm run build && node scripts/package-wgt.js",
-    "test": "node --test test/*.test.js",
+    "test": "node --test test/*.test.js ota/*.test.mjs",
     "e2e": "node scripts/e2e-web.mjs"
   },
   "dependencies": {

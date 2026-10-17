@@ -1,0 +1,58 @@
+name: Release TV app
+# Every push to main publishes a GitHub release with the packaged widget (v<major>.<minor>.<run>).
+# Installed TVs do not need it: Workers Builds deploys the same commit, and the app
+# downloads the new build from the Worker's /tv-app/ in the background (ota/).
+# The widget is for a first install or a tizen/config.xml change.
+# Signing uses the repository secrets TIZEN_AUTHOR_P12 / TIZEN_DISTRIBUTOR_P12 (base64)
+# and TIZEN_AUTHOR_PASSWORD / TIZEN_DISTRIBUTOR_PASSWORD; without them the widget is unsigned.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+      - name: Package
+        run: |
+          VERSION="$(node -p "require('./package.json').version.split('.').slice(0, 2).join('.')").${{ github.run_number }}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          TV_VERSION="$VERSION" node scripts/package-wgt.js
+      - name: Sign
+        env:
+          TIZEN_AUTHOR_P12: ${{ secrets.TIZEN_AUTHOR_P12 }}
+          TIZEN_AUTHOR_PASSWORD: ${{ secrets.TIZEN_AUTHOR_PASSWORD }}
+          TIZEN_DISTRIBUTOR_P12: ${{ secrets.TIZEN_DISTRIBUTOR_P12 }}
+          TIZEN_DISTRIBUTOR_PASSWORD: ${{ secrets.TIZEN_DISTRIBUTOR_PASSWORD }}
+        run: |
+          if [ -z "$TIZEN_AUTHOR_P12" ] || [ -z "$TIZEN_DISTRIBUTOR_P12" ]; then
+            echo "::warning::No Tizen certificate secrets: the release carries an unsigned widget."
+            exit 0
+          fi
+          bash .github/scripts/sign-wgt.sh build/widget build/HongguoTV.wgt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          WGT=build/HongguoTV.wgt
+          [ -f "$WGT" ] || WGT=build/HongguoTV-unsigned.wgt
+          NOTES="$(git log -1 --format='%s%n%n%b' "$GITHUB_SHA")
+
+          Commit: $GITHUB_SHA
+          Installed TVs update from https://hongguo.codeboxhk.com/tv-app/ on their own; install this widget only for a first install or a config.xml change."
+          gh release create "v$VERSION" "$WGT" --target "$GITHUB_SHA" --title "Hongguo TV $VERSION" --notes "$NOTES"

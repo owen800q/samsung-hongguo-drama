@@ -24,9 +24,7 @@ DEVICE="$(sdb devices | awk '/emulator.*device/{print $1; exit}')"
 
 npm run build
 npm run package -- --profile "$PROFILE"
-# sdb cannot transfer files with non-ASCII names (the widget is named after <name>).
 WGT="build/HongguoTV.wgt"
-cp "$(ls -t build/*.wgt | grep -v HongguoTV.wgt | head -1)" "$WGT"
 # sdb lists the device before the guest finishes booting (and TV images refuse
 # `sdb shell`), so retry the install for a while.
 for attempt in $(seq 1 20); do
