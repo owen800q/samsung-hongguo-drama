@@ -309,8 +309,24 @@ async function requestJson(url, options, deadline) {
   return parsed;
 }
 
-export async function fetchAppPlayUrl(vid) {
+/** Short edge of a stream in pixels, or 0 when the source gives no usable size. */
+function shortEdge(item) {
+  const meta = item.video_meta || {};
+  const pairs = [[item.vwidth, item.vheight], [item.width, item.height], [meta.vwidth, meta.vheight], [meta.width, meta.height]];
+  for (let i = 0; i < pairs.length; i++) {
+    const w = Number(pairs[i][0]); const h = Number(pairs[i][1]);
+    if (isFinite(w) && isFinite(h) && w > 0 && h > 0) return Math.min(w, h);
+  }
+  return 0;
+}
+
+/**
+ * `options.quality`: 'auto' (best first) or '720p' / '1080p'. A chosen quality only uses
+ * streams whose size confirms it, closest first, and never falls back to a lower one.
+ */
+export async function fetchAppPlayUrl(vid, options = {}) {
   vid = String(vid || '');
+  const wanted = options.quality === '720p' || options.quality === '1080p' ? options.quality : 'auto';
   if (!/^\d{1,30}$/.test(vid)) throw new Error('分集编号无效');
   const deadline = Date.now() + 15000;
   const payload = JSON.stringify({
@@ -333,16 +349,23 @@ export async function fetchAppPlayUrl(vid) {
   if (!info) throw new Error('App 接口未返回本集片源模型');
   const list = info.video_list || {};
   // Samsung TVs decode HEVC in hardware, so resolution still outranks codec here
-  // (the desktop app now prefers H.264 because it may have to transcode HEVC).
+  // (the desktop app now prefers H.264 because it may have to transcode HEVC). The real
+  // size outranks the quality label, which is sometimes wrong or missing.
   const rows = Object.keys(list).map(k => list[k]).filter(item => item && (item.main_url || item.backup_url || Array.isArray(item.backup_url_list))).map(item => {
     const meta = item.video_meta || {};
     const codec = str(item.codec_type || meta.codec_type).toLowerCase();
     const codecRank = ['h264', 'avc', 'avc1'].indexOf(codec) >= 0 ? 0 : ['hevc', 'h265', 'hvc1', 'hev1', 'bytevc1'].indexOf(codec) >= 0 ? 1 : 2;
     const quality = str(item.quality_desc || item.definition || item.height || item.vheight || meta.definition);
     const pm = quality.match(/\d+/);
-    return { item, codec, codecRank, quality, pixels: Number(pm ? pm[0] : 0) };
-  }).filter(row => row.codecRank < 2).sort((a, b) => b.pixels - a.pixels || a.codecRank - b.codecRank);
-  if (!rows.length) throw new Error('本集暂未提供兼容的 H.264/HEVC 片源');
+    const edge = shortEdge(item);
+    return { item, codec, codecRank, quality, edge, pixels: edge || Number(pm ? pm[0] : 0) };
+  }).filter(row => row.codecRank < 2 && (wanted === 'auto' || row.edge >= parseInt(wanted, 10))).sort((a, b) => wanted === 'auto'
+    ? b.pixels - a.pixels || a.codecRank - b.codecRank
+    : a.edge - b.edge || a.codecRank - b.codecRank);
+  if (!rows.length) {
+    throw Object.assign(new Error(wanted === 'auto' ? '本集暂未提供兼容的 H.264/HEVC 片源'
+      : '本集暂无可确认为 ' + wanted.toUpperCase() + ' 的片源，未自动降级'), { quality: wanted !== 'auto' });
+  }
   // Every usable address, best first: a stream's main address, then its backups, then the
   // next stream. The player falls back along this list when a download fails.
   let lastError = null;

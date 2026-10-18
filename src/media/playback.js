@@ -12,12 +12,14 @@ const MAX_BLOBS = 2;
 // A prefetch gives up on episodes larger than this, so warming the next episode never
 // holds two oversized buffers on a memory-constrained TV. Playing an episode lifts it.
 const PREFETCH_MAX_BYTES = 48 * 1024 * 1024;
-const blobs = new Map(); // vid -> { url, size, used, meta, dispose }
+const blobs = new Map(); // vid -> { url, size, used, meta, quality, dispose }
 const inflight = new Map(); // vid -> { promise, token, users }
 let fileSeq = 0;
 
-function touchBlob(vid) {
-  const entry = blobs.get(vid);
+function touchBlob(vid, quality) {
+  let entry = blobs.get(vid);
+  // An episode decrypted at another quality setting is not what the viewer chose now.
+  if (entry && entry.quality !== quality) { release(vid); entry = null; }
   if (entry) { blobs.delete(vid); entry.used = Date.now(); blobs.set(vid, entry); }
   return entry;
 }
@@ -43,7 +45,7 @@ export function releaseAll() {
   Array.from(blobs.keys()).forEach(release);
 }
 
-async function prepareEncrypted(vid, info, token, onProgress) {
+async function prepareEncrypted(vid, info, quality, token, onProgress) {
   const res = await request(info.url, {
     responseType: 'arraybuffer', timeout: 120000, cancel: token,
     onProgress: (loaded, total) => onProgress && onProgress('download', loaded, total),
@@ -79,7 +81,7 @@ async function prepareEncrypted(vid, info, token, onProgress) {
   }
   if (token.cancelled) { dispose(); throw new Error('已取消'); }
   release(vid);
-  blobs.set(vid, { url, size: clear.length, used: Date.now(), meta: info, dispose });
+  blobs.set(vid, { url, size: clear.length, used: Date.now(), meta: info, quality, dispose });
   evict(vid);
   return url;
 }
@@ -119,8 +121,9 @@ function result(src, info, encrypted, vid) {
 }
 
 /**
- * resolvePlayback(vid, seriesId, { cancel, onProgress(phase, loaded, total), force })
- * phase: 'fetch' (address lookup), 'download', 'decrypt'.
+ * resolvePlayback(vid, seriesId, { cancel, onProgress(phase, loaded, total), force, quality })
+ * phase: 'fetch' (address lookup), 'download', 'decrypt'. `quality` is the 红果 setting
+ * ('auto', '720p', '1080p'); other sources ignore it.
  * `force` reconnects: it drops the cached episode and any in-flight work, and looks the
  * address up again.
  */
@@ -128,28 +131,29 @@ export async function resolvePlayback(vid, seriesId, options = {}) {
   vid = String(vid);
   const onProgress = options.onProgress;
   const force = !!options.force;
+  const quality = options.quality || 'auto';
   if (force) release(vid);
-  const cached = touchBlob(vid);
+  const cached = touchBlob(vid, quality);
   if (cached) return result(cached.url, cached.meta, true, vid);
 
   let job = inflight.get(vid);
   // Reconnecting abandons work that was started with the old address.
-  if (job && force && !job.force) job.token.cancel();
+  if (job && ((force && !job.force) || job.quality !== quality)) job.token.cancel();
   // A job already cancelled (e.g. a prefetch that hit its size cap) is only winding down.
   if (job && job.token.cancelled) job = null;
   if (!job) {
     const token = new CancelToken();
-    job = { token, users: 0, force, maxBytes: options.prefetch ? PREFETCH_MAX_BYTES : Infinity };
+    job = { token, users: 0, force, quality, maxBytes: options.prefetch ? PREFETCH_MAX_BYTES : Infinity };
     job.promise = (async () => {
       job.progress && job.progress('fetch', 0, 0);
-      const info = await getPlayInfo(vid, seriesId, { force });
+      const info = await getPlayInfo(vid, seriesId, { force, quality });
       if (token.cancelled) throw new Error('已取消');
       if (!info.contentKey) return { src: info.url, info, encrypted: false };
       const candidates = encryptedCandidates(info);
       let firstError = null;
       for (let i = 0; i < candidates.length; i++) {
         try {
-          const url = await prepareEncrypted(vid, candidates[i], token, (p, l, t) => {
+          const url = await prepareEncrypted(vid, candidates[i], quality, token, (p, l, t) => {
             if (p === 'download' && Math.max(l, t) > job.maxBytes) token.cancel();
             job.progress && job.progress(p, l, t);
           });
@@ -186,6 +190,6 @@ export async function resolvePlayback(vid, seriesId, options = {}) {
  * Warm up the next episode (address lookup, and download + decryption when needed).
  * Cancelling `cancel` abandons the work unless the player has started using it. Never throws.
  */
-export function prefetch(vid, seriesId, cancel) {
-  return resolvePlayback(vid, seriesId, { cancel, prefetch: true }).then(() => true, () => false);
+export function prefetch(vid, seriesId, cancel, quality) {
+  return resolvePlayback(vid, seriesId, { cancel, prefetch: true, quality }).then(() => true, () => false);
 }

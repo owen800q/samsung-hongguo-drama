@@ -154,6 +154,27 @@ try {
   // Leave: player → detail → home → exit dialog → exit.
   for (let i = 0; i < 6 && (await page.$('video.player-video, .detail')); i++) { await key(10009); await page.waitForTimeout(500); }
   check('back returns to home', !!(await page.$('.poster')), await focused());
+
+  // Settings: the 红果 quality row cycles with the remote, is saved, and fits on screen.
+  for (let i = 0; i < 8 && !/sidebar-item/.test(await focused()); i++) await key(37);
+  for (let i = 0; i < 6 && !/设置/.test(await focused()); i++) await key(40);
+  await key(13);
+  await page.waitForSelector('.settings', { timeout: 10000 });
+  for (let i = 0; i < 8 && !/红果清晰度/.test(await focused()); i++) await key(40);
+  const qualityValue = () => page.evaluate(() => { const v = document.activeElement.querySelector('.setting-value'); return v ? v.textContent : ''; });
+  const qualityBefore = await qualityValue();
+  await key(13);
+  const saved = await page.evaluate(() => { try { return Object.values(localStorage).join(' '); } catch (_) { return ''; } });
+  check('quality setting cycles with the remote and is saved', qualityBefore === '自动' && (await qualityValue()) === '720P' && /"hongguoQuality":"720p"/.test(saved), qualityBefore + ' -> ' + (await qualityValue()));
+  check('quality row fits the 1920 layout', await page.evaluate(() => {
+    const r = document.activeElement.getBoundingClientRect();
+    return r.right <= 1920 && r.bottom <= 1080 && document.activeElement.scrollWidth <= document.activeElement.clientWidth + 1;
+  }));
+  await key(13); await key(13);
+  check('quality setting cycles back to auto', (await qualityValue()) === '自动', await qualityValue());
+  await key(10009); await page.waitForTimeout(500);
+  check('back from settings returns to home', !!(await page.$('.poster')), await focused());
+
   await key(10009); await page.waitForTimeout(500);
   const dialog = await page.evaluate(() => { const d = document.querySelector('[data-focus-scope]'); return d ? d.textContent : ''; });
   check('back on home asks to exit', /退出/.test(dialog), dialog.slice(0, 40));

@@ -159,8 +159,26 @@ async function fetchPlayInfoFresh(vid, sid, skipWeb) {
   throw new Error('红果官网与备用接口均未提供播放地址，请稍后重试');
 }
 
-/** `options.force` looks the address up again instead of reusing a recent one. */
+// A chosen quality needs the App source: the website gives one stream of unknown size.
+async function fetchPlayInfoAtQuality(vid, quality) {
+  try {
+    return await fetchAppPlayUrl(vid, { quality });
+  } catch (error) {
+    if (error && error.network) throw new Error('网络连接失败，未能获取播放地址，请检查电视网络后重试');
+    const reason = error && error.quality ? error.message : '备用接口未提供 ' + quality.toUpperCase() + ' 片源，未自动降级';
+    throw new Error(reason + '。可在「设置」里把红果清晰度改为「自动」后重试。');
+  }
+}
+
+/**
+ * `options.force` looks the address up again instead of reusing a recent one.
+ * `options.quality`: 'auto', '720p' or '1080p' (see fetchAppPlayUrl).
+ */
 export function fetchPlayInfo(vid, sid, options = {}) {
+  const quality = options.quality === '720p' || options.quality === '1080p' ? options.quality : 'auto';
+  if (quality !== 'auto') {
+    return playCache('play:' + vid + ':' + quality, () => fetchPlayInfoAtQuality(String(vid), quality), options.force);
+  }
   const skipWeb = (failedWebMedia.get(String(vid)) || 0) > Date.now();
   return playCache('play:' + (sid || '') + ':' + vid + (skipWeb ? ':fallback' : ''),
     () => fetchPlayInfoFresh(String(vid), sid ? String(sid) : '', skipWeb), options.force);

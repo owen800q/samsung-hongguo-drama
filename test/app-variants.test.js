@@ -93,3 +93,43 @@ test('a download timeout does not try the other addresses', async () => {
   await assert.rejects(resolvePlayback('9000000000000000006', '', { force: true }), /请求超时/);
   assert.deepEqual(requested.filter(u => /qznovelvod/.test(u)), [MEDIA.main1080]);
 });
+
+test('actual size outranks a wrong quality label', async () => {
+  fake({ outer: { code: 0, video_info: { code: 0, data: { video_list: {
+    video_1: { codec_type: 'h264', definition: '1080p', main_url: MEDIA.main720, video_meta: { vwidth: 360, vheight: 640 }, spade_a: spadeFor(KEY) },
+    video_2: { codec_type: 'h264', definition: '720p', main_url: MEDIA.main1080, video_meta: { vwidth: 1080, vheight: 1920 }, spade_a: spadeFor(KEY) },
+  } } } } });
+  const info = await getPlayInfo('9000000000000000007', '', { force: true });
+  assert.deepEqual(info.variants.map(v => v.url), [MEDIA.main1080, MEDIA.main720]);
+});
+
+function sizedList() {
+  return {
+    video_1: { codec_type: 'bytevc1', definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280, spade_a: spadeFor(KEY) },
+    video_2: { codec_type: 'bytevc1', definition: '1080p', main_url: MEDIA.main1080, backup_url_list: [MEDIA.backup1080], vwidth: 1080, vheight: 1920, spade_a: spadeFor(KEY) },
+    video_3: { codec_type: 'h264', definition: '1080p', main_url: 'https://v1.qznovelvod.com/unsized.mp4', spade_a: spadeFor(KEY) },
+  };
+}
+
+test('a chosen quality uses the closest confirmed stream and skips the website', async () => {
+  const requested = fake({ outer: { code: 0, video_info: { code: 0, data: { video_list: sizedList() } } } });
+  const info = await getPlayInfo('9000000000000000008', '123', { force: true, quality: '720p' });
+  assert.deepEqual(info.variants.map(v => v.url), [MEDIA.main720, MEDIA.main1080, MEDIA.backup1080]);
+  assert.ok(!requested.some(u => /hongguoduanju\.com/.test(u)));
+  const hd = await getPlayInfo('9000000000000000008', '123', { force: true, quality: '1080p' });
+  assert.deepEqual(hd.variants.map(v => v.url), [MEDIA.main1080, MEDIA.backup1080]);
+});
+
+test('a chosen quality that is missing is reported, not downgraded', async () => {
+  const list = sizedList();
+  delete list.video_2;
+  fake({ outer: { code: 0, video_info: { code: 0, data: { video_list: list } } } });
+  await assert.rejects(getPlayInfo('9000000000000000009', '', { force: true, quality: '1080p' }), /1080P.*未自动降级.*设置/);
+});
+
+test('each quality setting looks up its own streams', async () => {
+  const requested = fake({ outer: { code: 0, video_info: { code: 0, data: { video_list: sizedList() } } } });
+  await assert.rejects(resolvePlayback('9000000000000000010', '', { quality: '1080p' }), /HTTP 404/);
+  await assert.rejects(resolvePlayback('9000000000000000010', '', { quality: '720p' }), /HTTP 404/);
+  assert.deepEqual(requested.filter(u => /qznovelvod/.test(u)), [MEDIA.main1080, MEDIA.backup1080, MEDIA.main720, MEDIA.main1080, MEDIA.backup1080]);
+});
