@@ -114,6 +114,7 @@ export function Player({ series, index: startIndex, fromStart }) {
     const resolving = resolvePlayback(episode.vid, series.series_id, {
       cancel: token,
       force: !!reloadRequest,
+      quality: getSettings().hongguoQuality,
       onProgress: (phase, loaded, total) => { if (!token.cancelled) setProgress({ phase, loaded, total }); },
     });
     // Drop the previous episode's prefetch only after this episode joined it, so a
@@ -223,7 +224,7 @@ export function Player({ series, index: startIndex, fromStart }) {
     cancelPrefetch();
     prefetched.current = next.vid;
     prefetchToken.current = new CancelToken();
-    prefetch(next.vid, series.series_id, prefetchToken.current);
+    prefetch(next.vid, series.series_id, prefetchToken.current, getSettings().hongguoQuality);
   }
   function cancelPrefetch() {
     if (prefetchToken.current) prefetchToken.current.cancel();

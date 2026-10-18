@@ -41,6 +41,7 @@ export const DEFAULT_SETTINGS = {
   defaultSource: 'hongguo',
   seekStep: 10,
   cacheNext: true,
+  hongguoQuality: 'auto',
 };
 
 export function getSettings() {
