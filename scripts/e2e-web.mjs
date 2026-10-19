@@ -182,6 +182,40 @@ try {
   await key(13);
   check('exit calls tizen application exit', await page.evaluate(() => window.__exited));
   check('no uncaught page errors', errors.length === 0, errors.join(' / '));
+
+  // A rendering error shows a recovery prompt the remote can use, instead of a blank screen.
+  const crash = await ctx.newPage();
+  await crash.addInitScript(() => {
+    // Inserting the detail screen throws once, like a bug in its render would.
+    const wrap = name => {
+      const original = Node.prototype[name];
+      Node.prototype[name] = function (node) {
+        if (window.__crashDetail && node && node.classList && node.classList.contains('screen-detail')) {
+          window.__crashDetail = false;
+          throw new Error('e2e crash');
+        }
+        return original.apply(this, arguments);
+      };
+    };
+    wrap('insertBefore'); wrap('appendChild');
+  });
+  await crash.goto(URL_);
+  await crash.waitForSelector('.poster.focusable', { timeout: 30000 });
+  await crash.evaluate(() => { window.__crashDetail = true; document.querySelector('.poster.focusable').focus(); });
+  await crash.keyboard.press('Enter');
+  await crash.waitForSelector('.error-boundary', { timeout: 10000 }).catch(() => {});
+  await crash.waitForTimeout(400);
+  const prompt = await crash.evaluate(() => {
+    const a = document.activeElement;
+    const b = document.querySelector('.error-boundary .btn');
+    const r = b && b.getBoundingClientRect();
+    return { text: (document.querySelector('.error-boundary') || {}).textContent || '', focused: !!b && a === b, fits: !!r && r.right <= 1920 && r.bottom <= 1080 };
+  });
+  check('a render error shows a recovery prompt with reload focused', /界面出现异常/.test(prompt.text) && prompt.focused && prompt.fits, JSON.stringify(prompt).slice(0, 120));
+  await Promise.all([crash.waitForEvent('load', { timeout: 15000 }), crash.keyboard.press('Enter')]).catch(() => {});
+  await crash.waitForSelector('.poster.focusable', { timeout: 30000 }).catch(() => {});
+  check('OK on the recovery prompt reloads the app', !!(await crash.$('.poster.focusable')) && !(await crash.$('.error-boundary')));
+  await crash.close();
 } catch (e) {
   check('e2e run completed', false, String(e && e.stack || e));
   await page.screenshot({ path: path.join(os.tmpdir(), 'hgtv-e2e-failure.png') }).catch(() => {});
