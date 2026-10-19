@@ -12,6 +12,9 @@ const MAX_BLOBS = 2;
 // A prefetch gives up on episodes larger than this, so warming the next episode never
 // holds two oversized buffers on a memory-constrained TV. Playing an episode lifts it.
 const PREFETCH_MAX_BYTES = 48 * 1024 * 1024;
+// A whole episode is held in memory (download, then decryption) before it can play. An
+// abnormally large file would exhaust the TV's memory, so playing gives up past this.
+let playMaxBytes = 300 * 1024 * 1024;
 const blobs = new Map(); // vid -> { url, size, used, meta, quality, dispose }
 const inflight = new Map(); // vid -> { promise, token, users }
 let fileSeq = 0;
@@ -45,13 +48,38 @@ export function releaseAll() {
   Array.from(blobs.keys()).forEach(release);
 }
 
+/** Tests lower the in-memory size limit for playing. */
+export function setPlayMaxBytes(bytes) {
+  playMaxBytes = bytes || 300 * 1024 * 1024;
+}
+
+function tooLarge(quality) {
+  const hint = quality === '720p' ? '请换一个片源' : '可在设置中把红果清晰度改为 720P 后重试';
+  return Object.assign(new Error('本集文件过大，电视内存放不下，' + hint), { code: 'MEDIA_TOO_LARGE' });
+}
+
 async function prepareEncrypted(vid, info, quality, token, onProgress) {
-  const res = await request(info.url, {
-    responseType: 'arraybuffer', timeout: 120000, cancel: token,
-    onProgress: (loaded, total) => onProgress && onProgress('download', loaded, total),
-  });
+  // Its own token, so an oversized address is abandoned without cancelling the whole job.
+  const transfer = new CancelToken();
+  const unsubscribe = token.subscribe(() => transfer.cancel());
+  let oversized = false;
+  let res;
+  try {
+    res = await request(info.url, {
+      responseType: 'arraybuffer', timeout: 120000, cancel: transfer,
+      onProgress: (loaded, total) => {
+        onProgress && onProgress('download', loaded, total);
+        if (Math.max(loaded, total) > playMaxBytes && !token.cancelled) { oversized = true; transfer.cancel(); }
+      },
+    });
+  } catch (error) {
+    throw oversized && !token.cancelled ? tooLarge(quality) : error;
+  } finally {
+    unsubscribe();
+  }
   const data = new Uint8Array(res.data);
   if (token.cancelled) throw new Error('已取消');
+  if (data.length > playMaxBytes) throw tooLarge(quality);
   // An expired address can answer 200 with an error page instead of the video.
   const type = res.header ? res.header('content-type') || '' : '';
   if (/text\/html|application\/json/i.test(type)) throw new Error('片源返回了错误页面，请重新获取片源');
@@ -100,10 +128,11 @@ function encryptedCandidates(info) {
   }).slice(0, MAX_TRANSFERS);
 }
 
-// Errors from fetching the media itself, where another address may succeed. A timeout
-// usually means a slow network, which another address would not fix.
+// Errors from fetching the media itself, where another address (perhaps a smaller one) may
+// succeed. A timeout usually means a slow network, which another address would not fix.
 function isTransferFailure(error) {
   if (error instanceof HttpError) return error.status > 0 || error.message === '网络连接失败';
+  if (error && error.code === 'MEDIA_TOO_LARGE') return true;
   return /片源返回了错误页面|片源下载不完整/.test(String(error && error.message));
 }
 
@@ -160,7 +189,8 @@ export async function resolvePlayback(vid, seriesId, options = {}) {
           return { src: url, info: candidates[i], encrypted: true };
         } catch (error) {
           if (token.cancelled || !isTransferFailure(error)) throw error;
-          firstError = firstError || error;
+          // Being too large is what the viewer can act on (a lower quality), so it is reported first.
+          if (!firstError || (error.code === 'MEDIA_TOO_LARGE' && firstError.code !== 'MEDIA_TOO_LARGE')) firstError = error;
         }
       }
       throw firstError;

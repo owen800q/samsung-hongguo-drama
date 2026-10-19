@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTransport, HttpError } from '../src/lib/http.js';
 import { getPlayInfo } from '../src/sources/index.js';
-import { resolvePlayback } from '../src/media/playback.js';
+import { resolvePlayback, setPlayMaxBytes } from '../src/media/playback.js';
 
 const KEY = '0123456789abcdef0123456789abcdef';
 
@@ -52,7 +52,7 @@ function fake({ outer, api, media = {} } = {}) {
       return reply(200, JSON.stringify({ code: 0, data: { [vid]: { video_model: JSON.stringify({ fallback_api: 'https://vas.snssdk.com/video/fallback' }) } } }));
     }
     if (/vas\.snssdk\.com/.test(url)) return reply(200, JSON.stringify(outer || { code: 0, video_info: { code: 0, data: { video_list: videoList() } } }));
-    if (media[url]) return media[url](reply);
+    if (media[url]) return media[url](reply, options);
     return reply(404, new ArrayBuffer(0), 'text/plain');
   });
   return requested;
@@ -132,4 +132,31 @@ test('each quality setting looks up its own streams', async () => {
   await assert.rejects(resolvePlayback('9000000000000000010', '', { quality: '1080p' }), /HTTP 404/);
   await assert.rejects(resolvePlayback('9000000000000000010', '', { quality: '720p' }), /HTTP 404/);
   assert.deepEqual(requested.filter(u => /qznovelvod/.test(u)), [MEDIA.main1080, MEDIA.backup1080, MEDIA.main720, MEDIA.main1080, MEDIA.backup1080]);
+});
+
+test('an episode too large for the TV memory moves on to another address, then says so', async () => {
+  setPlayMaxBytes(8);
+  let aborted = false;
+  const requested = fake({ media: {
+    // Declared size: the transfer is abandoned on its first progress event.
+    [MEDIA.backup1080]: (reply, options) => {
+      options.cancel.subscribe(() => { aborted = true; });
+      options.onProgress(4, 20);
+      if (aborted) throw new HttpError('已取消', -1);
+      return reply(200, new ArrayBuffer(20), 'video/mp4');
+    },
+    // Undeclared size: checked once it has arrived.
+    [MEDIA.main720]: reply => reply(200, new ArrayBuffer(12), 'video/mp4'),
+  } });
+  try {
+    await assert.rejects(resolvePlayback('9000000000000000011', '', { force: true }), err => {
+      assert.equal(err.code, 'MEDIA_TOO_LARGE');
+      assert.match(err.message, /过大.*红果清晰度改为 720P/);
+      return true;
+    });
+  } finally {
+    setPlayMaxBytes();
+  }
+  assert.ok(aborted, 'the oversized download is aborted');
+  assert.deepEqual(requested.filter(u => /qznovelvod/.test(u)), [MEDIA.main1080, MEDIA.backup1080, MEDIA.main720]);
 });

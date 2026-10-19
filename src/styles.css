@@ -162,6 +162,9 @@ h1, h2, p { margin: 0; }
 .status > * + * { margin-top: 20px; }
 .status-title { font-size: 34px; font-weight: 600; color: var(--text); }
 .status-text { font-size: 24px; color: var(--muted); max-width: 1100px; }
+.error-boundary { display: flex; align-items: center; justify-content: center; }
+.error-boundary .status-text { max-width: 900px; line-height: 1.6; }
+.error-boundary .btn { margin-top: 44px; }
 .spinner { display: inline-block; width: 52px; height: 52px; border-radius: 50%; border: 5px solid rgba(255, 255, 255, 0.18); border-top-color: var(--accent); animation: spin 0.9s linear infinite; }
 .spinner-lg { width: 80px; height: 80px; border-width: 7px; }
 @keyframes spin { to { transform: rotate(360deg); } }
