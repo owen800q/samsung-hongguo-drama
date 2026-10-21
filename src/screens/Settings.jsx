@@ -1,4 +1,4 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { SOURCES } from '../sources/index.js';
 import { clearHistory, clearSearches, getSettings, saveSettings } from '../lib/storage.js';
 import { appVersion } from '../platform/tv.js';
@@ -9,6 +9,24 @@ const RATES = [0.75, 1, 1.25, 1.5, 2];
 const STEPS = [5, 10, 15, 30];
 const QUALITIES = ['auto', '720p', '1080p'];
 const QUALITY_LABELS = { auto: '自动', '720p': '720P', '1080p': '1080P' };
+
+// What the OTA loader's check reports (ota/ota.js), other than a downloaded build.
+const UPDATE_RESULTS = {
+  current: ['已是最新版本'],
+  busy: ['正在后台检查更新，请稍后再试'],
+  off: ['此安装包未启用在线更新，请从 GitHub Release 安装新版'],
+  error: ['检查更新失败，请检查网络后重试', 'error'],
+};
+
+/** The loader that runs the packaged app (ota/ota.js); absent in development and in widgets built without updates. */
+function ota() {
+  return typeof window !== 'undefined' ? window.__ota : null;
+}
+
+function buildLabel() {
+  const o = ota();
+  return o && o.running ? '构建 ' + String(o.running).slice(0, 7) + (o.remote ? '（在线更新）' : '') : '';
+}
 
 function cycle(list, value) {
   const i = list.indexOf(value);
@@ -27,7 +45,24 @@ function Row({ label, value, hint, onSelect, autofocus }) {
 export function Settings() {
   const [s, setS] = useState(getSettings);
   const [confirm, setConfirm] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [restart, setRestart] = useState(false);
+  const mounted = useRef(true);
+  useEffect(() => () => { mounted.current = false; }, []);
   const set = patch => setS(saveSettings(patch));
+  const checkUpdate = () => {
+    const o = ota();
+    if (!o || typeof o.check !== 'function') { toast(UPDATE_RESULTS.off[0]); return; }
+    if (checking) return;
+    setChecking(true);
+    o.check(result => {
+      if (!mounted.current) return;
+      setChecking(false);
+      if (result === 'downloaded' || result === 'pending') { setRestart(true); return; }
+      const [message, kind] = UPDATE_RESULTS[result] || UPDATE_RESULTS.error;
+      toast(message, kind);
+    });
+  };
   const sourceLabel = (SOURCES.find(x => x.id === s.defaultSource) || SOURCES[0]).label;
 
   return (
@@ -51,8 +86,12 @@ export function Settings() {
           <Row label="清空观看记录" hint="追剧列表不受影响" onSelect={() => setConfirm(true)} />
         </div>
         <h2 class="section-title">关于</h2>
+        <div class="settings-group">
+          <Row label="检查更新" hint="应用会在后台自动更新，下次打开时生效；也可以在这里立即检查，下载好后重新启动即可使用新版"
+            value={checking ? '检查中…' : null} onSelect={checkUpdate} />
+        </div>
         <div class="about">
-          <p><b>红果短剧 · 三星电视版</b> {appVersion()}</p>
+          <p><b>红果短剧 · 三星电视版</b> {appVersion()}{buildLabel() && ' · ' + buildLabel()}</p>
           <p>社区维护的开源移植版，基于 hongguo-drama 桌面版，以 GPL-3.0 许可发布。不是红果、西饭或河马的官方客户端，也未获平台背书；不提供付费分集解锁，不保证所有剧集可播放。</p>
           <p>遥控器：方向键移动，确认键选择，返回键后退；播放时左右键快进快退，频道键切换剧集，绿色键选集，黄色键倍速。</p>
         </div>
@@ -61,6 +100,11 @@ export function Settings() {
         <Dialog title="清空全部观看记录？" message="清空后无法恢复。"
           actions={[{ label: '清空', danger: true, onSelect: () => { clearHistory(); setConfirm(false); toast('观看记录已清空'); } }, { label: '取消', autofocus: true, onSelect: () => setConfirm(false) }]}
           onClose={() => setConfirm(false)} />
+      )}
+      {restart && (
+        <Dialog title="新版本已下载" message="重新启动应用即可使用新版，也可以下次打开时再生效。"
+          actions={[{ label: '立即重启', autofocus: true, onSelect: () => window.location.reload() }, { label: '稍后', onSelect: () => setRestart(false) }]}
+          onClose={() => setRestart(false)} />
       )}
     </div>
   );

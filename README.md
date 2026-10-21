@@ -63,13 +63,13 @@ npm run package -- --profile <证书配置名>  # 已安装 Tizen CLI 时直接�
 
 ### 自动更新
 
-装好的电视会自己更新，不用再用 sdb 重装。Cloudflare Worker `hongguo.codeboxhk.com`（`wrangler.jsonc`，推送到 `main` 时由 Workers Builds 部署）在 `/tv-app/` 发布最新构建（`scripts/ota-update.mjs`）。应用启动后在后台下载新版，下次打开时生效。原理与回退机制见 [ota/README.md](ota/README.md)。
+装好的电视会自己更新，不用再用 sdb 重装。Cloudflare Worker `hongguo.codeboxhk.com`（`wrangler.jsonc`，推送到 `main` 时由 Workers Builds 部署）在 `/tv-app/` 发布最新构建（`scripts/ota-update.mjs`）。应用启动后在后台下载新版，下次打开时生效。也可以在「设置 → 关于 → 检查更新」立即检查，下载完成后选「立即重启」马上换成新版；「关于」里显示当前运行的构建号。原理与回退机制见 [ota/README.md](ota/README.md)。
 
 每次推送到 `main` 也会发布一个附带 widget 的 GitHub Release（`.github/workflows/release.yml`）。只有改了 `tizen/config.xml`、图标或加载器时才需要重装。仓库设置了 ota/README.md 列出的证书 Secrets 时，Release 里的 widget 会签好名。
 
 **模拟器**：安装 `TV-SAMSUNG-Public-Emulator` 后运行 `scripts/emulator.sh <证书配置名>`，脚本会创建虚拟机、启动、构建签名并安装运行。三星电视模拟器和真机一样，只接受三星证书：在 Certificate Manager 里创建 Samsung → TV 证书配置，分发者证书选 Public，并把模拟器的 DUID 加进去（模拟器连接时用 `sdb -s <设备> shell 0 getduid` 查看）。普通 Tizen 证书会被拒绝，报错 `Invalid certificate chain`。macOS 上模拟器依赖 Intel HAXM（不支持 Hypervisor.framework），安装 HAXM 后需要重启一次。
 
-`npm run e2e` 用 Chromium（1920×1080，模拟 `tizen.tvinputdevice`，关闭跨域限制，相当于 config.xml 白名单）加载构建产物，用遥控器键码走一遍：首页 → 详情 → 播放官网分集（快进、暂停/播放、绿色键选集、频道键换集）→ 返回 → 加密分集（让第一个 App 地址返回 404，确认改用下一个地址并完成解密）→ 返回首页 → 设置里切换红果清晰度 → 返回首页 → 退出。开源 Chromium 不带 H.264/HEVC 解码器，所以官网分集用 ffmpeg 生成的 VP9 测试片代替，加密分集只检查到解密后交给播放器为止。
+`npm run e2e` 用 Chromium（1920×1080，模拟 `tizen.tvinputdevice`，关闭跨域限制，相当于 config.xml 白名单）加载构建产物，用遥控器键码走一遍：首页 → 详情 → 播放官网分集（快进、暂停/播放、绿色键选集、频道键换集）→ 返回 → 加密分集（让第一个 App 地址返回 404，确认改用下一个地址并完成解密）→ 返回首页 → 设置里切换红果清晰度、检查更新（已是最新时提示，下载到新版时弹出「立即重启」，返回键关闭）→ 返回首页 → 退出。开源 Chromium 不带 H.264/HEVC 解码器，所以官网分集用 ffmpeg 生成的 VP9 测试片代替，加密分集只检查到解密后交给播放器为止。
 
 ## 兼容性
 
