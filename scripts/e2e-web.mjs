@@ -35,6 +35,10 @@ await page.addInitScript(() => {
     },
     application: { getCurrentApplication: () => ({ exit: () => { window.__exited = true; }, appInfo: { version: '1.0.0' } }) },
   };
+  // The packaged widget's OTA loader (ota/ota.js); the result of a check is set by the test.
+  window.__otaResult = 'current';
+  window.__ota = { running: '0123456789abcdef', bundled: '0123456789abcdef', remote: false,
+    check: cb => setTimeout(() => cb(window.__otaResult), 300) };
 });
 
 // Remote keys: arrows/Enter as real key presses, the rest as keydown with the TV key code.
@@ -172,6 +176,31 @@ try {
   }));
   await key(13); await key(13);
   check('quality setting cycles back to auto', (await qualityValue()) === '自动', await qualityValue());
+
+  // Settings → 检查更新: up to date says so; a downloaded build offers a restart, focused, that Back dismisses.
+  for (let i = 0; i < 8 && !/检查更新/.test(await focused()); i++) await key(40);
+  check('check-for-updates row is reachable with the remote and on screen', /检查更新/.test(await focused()) && await page.evaluate(() => {
+    const r = document.activeElement.getBoundingClientRect();
+    return r.top >= 0 && r.right <= 1920 && r.bottom <= 1080;
+  }), await focused());
+  check('about shows the running build', /构建 0123456/.test(await page.textContent('.about')));
+  await key(13); await page.waitForTimeout(500);
+  const toastText = () => page.evaluate(() => Array.from(document.querySelectorAll('.toast')).map(t => t.textContent).join(' / '));
+  check('checking an up-to-date app says so', /已是最新版本/.test(await toastText()), await toastText());
+  await page.evaluate(() => { window.__otaResult = 'downloaded'; });
+  await key(13); await page.waitForTimeout(500);
+  const restart = await page.evaluate(() => {
+    const d = document.querySelector('.dialog');
+    const a = document.activeElement;
+    const r = a.getBoundingClientRect();
+    return { text: d ? d.textContent : '', focused: (a.textContent || '').trim(), fits: r.right <= 1920 && r.bottom <= 1080 };
+  });
+  check('a downloaded update offers a restart with it focused', /新版本已下载/.test(restart.text) && restart.focused === '立即重启' && restart.fits, JSON.stringify(restart).slice(0, 120));
+  await key(39);
+  check('the restart dialog keeps focus inside it', /稍后/.test(await focused()), await focused());
+  await key(10009); await page.waitForTimeout(400);
+  check('back closes the restart dialog and returns to the row', !(await page.$('.dialog')) && /检查更新/.test(await focused()), await focused());
+
   await key(10009); await page.waitForTimeout(500);
   check('back from settings returns to home', !!(await page.$('.poster')), await focused());
 

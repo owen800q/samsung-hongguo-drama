@@ -10,7 +10,8 @@ The packaged widget updates itself from this repository's Cloudflare Worker, so 
   1. The app starts at once from the newest build already on the TV: either `app/` or a build downloaded earlier. The loader writes that build's page in place with a `<base>` pointing at it. Nothing waits on the network.
   2. Ten seconds after the page has loaded, and again when the app returns to the foreground after 3 hours or more, the loader fetches the manifest. It never does this while a video is playing.
   3. If the manifest names a different build, the loader downloads every file, checks the sizes, and records the build in `localStorage`. The files land in the HTTP cache (`immutable`, one year). A notice (15 seconds) says the update applies at the next launch.
-  4. The next launch runs the new build from the cache and says once that the app was updated.
+  4. Settings → 关于 → 检查更新 runs the same check on demand (`window.__ota.check`). When a build is downloaded, or was already waiting, it offers 立即重启, which reloads the page so the loader starts the new build now.
+  5. The next launch runs the new build from the cache and says once that the app was updated.
 
 ## Safety
 
