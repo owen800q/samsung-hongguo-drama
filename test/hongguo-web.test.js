@@ -25,6 +25,12 @@ test('web media comes from the VideoObject bound to this player', () => {
   // A first episode's page uses the series URL as its canonical address.
   const first = video('https://hongguoduanju.com/player/' + SID, 'https://hongguoduanju.com/video/public/' + VID + '/360p.mp4');
   assert.equal(pickWebMedia(page({ videos: [first] }), VID, SID), 'https://hongguoduanju.com/video/public/' + VID + '/360p.mp4');
+  // ...but only with the site's own media path for this episode.
+  const firstOther = video('https://hongguoduanju.com/player/' + SID, 'https://hongguoduanju.com/video/public/2/360p.mp4');
+  assert.equal(pickWebMedia(page({ videos: [firstOther] }), VID, SID), '');
+  const firstCdn = video('https://hongguoduanju.com/player/' + SID, 'https://cdn.example.com/video/public/' + VID + '/360p.mp4');
+  assert.equal(pickWebMedia(page({ videos: [firstCdn] }), VID, SID), '');
+  assert.equal(pickWebMedia(page({ videos: [firstOther, first] }), VID, SID), 'https://hongguoduanju.com/video/public/' + VID + '/360p.mp4');
   assert.equal(pickWebMedia(page({ videos: [own] }), VID, ''), 'https://hongguoduanju.com/video/public/' + VID + '/360p.mp4?a=1');
 });
 

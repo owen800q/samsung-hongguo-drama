@@ -9,16 +9,23 @@ export function Spinner({ label }) {
   );
 }
 
-/** Empty or error state with an optional retry button. */
-export function Empty({ title, message, actionLabel, onAction, autofocus }) {
+/** Empty or error state with an optional retry button and a second way out. */
+export function Empty({ title, message, actionLabel, onAction, autofocus, secondaryLabel, onSecondary }) {
   return (
     <div class="status status-empty">
       <div class="status-title">{title}</div>
       {message && <div class="status-text">{message}</div>}
-      {onAction && (
-        <button type="button" tabIndex={-1} class="btn focusable" data-autofocus={autofocus ? '' : undefined} onClick={onAction}>
-          <Icon name="refresh" />{actionLabel || '重试'}
-        </button>
+      {(onAction || onSecondary) && (
+        <div class="status-actions">
+          {onAction && (
+            <button type="button" tabIndex={-1} class="btn focusable" data-autofocus={autofocus ? '' : undefined} onClick={onAction}>
+              <Icon name="refresh" />{actionLabel || '重试'}
+            </button>
+          )}
+          {onSecondary && (
+            <button type="button" tabIndex={-1} class="btn btn-ghost focusable" onClick={onSecondary}>{secondaryLabel}</button>
+          )}
+        </div>
       )}
     </div>
   );

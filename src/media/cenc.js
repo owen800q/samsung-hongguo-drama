@@ -58,6 +58,29 @@ function findFrma(data, start, end) {
   return '';
 }
 
+/**
+ * The clear sample entry type of an encrypted video entry whose child boxes span start..end.
+ * frma names it; without one, the codec config box decides. H.264 must not be labelled HEVC
+ * (or the other way round), so a type the config does not back is refused.
+ */
+export function clearVideoType(data, start, end) {
+  let avc = false, hevc = false;
+  let q = start;
+  while (q + 8 <= end) {
+    const { size, typ } = boxHeader(data, q, end);
+    if (size < 8) break;
+    if (typ === 'avcC') avc = true;
+    if (typ === 'hvcC') hevc = true;
+    q += size;
+  }
+  const type = findFrma(data, start, end) || (avc && !hevc ? 'avc1' : hevc && !avc ? 'hvc1' : '');
+  const known = ['avc1', 'avc3', 'hvc1', 'hev1'].indexOf(type) >= 0;
+  if (!known || (type.indexOf('avc') === 0 ? !avc || hevc : !hevc || avc)) {
+    throw new Error('无法确定加密视频的原始编码，请更换片源重试');
+  }
+  return type;
+}
+
 function rebuildMoov(data, moovSize, top) {
   const moovBox = top.find(b => b.typ === 'moov');
   if (!moovBox) throw new Error('no moov box');
@@ -82,7 +105,8 @@ function rebuildMoov(data, moovSize, top) {
       const etyp = latin1(data, p + 4, p + 8);
       if (etyp === 'encv' || etyp === 'enca') {
         const hdrSize = etyp === 'encv' ? 78 : 28;
-        const original = findFrma(data, p + 8 + hdrSize, p + esize) || (etyp === 'encv' ? 'hvc1' : 'mp4a');
+        const original = etyp === 'encv' ? clearVideoType(data, p + 8 + hdrSize, p + esize)
+          : findFrma(data, p + 8 + hdrSize, p + esize) || 'mp4a';
         const parts = [];
         const head = new Uint8Array(8 + hdrSize);
         head.set(fromLatin1(original), 4);

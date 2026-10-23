@@ -55,6 +55,9 @@ export function Browse() {
     if (state.hasMore && !state.loading) load(state.page + 1);
   };
 
+  // When a source's catalog is unreachable (红果 often is), offer the next one straight from the error.
+  const fallback = SOURCES[(SOURCES.findIndex(s => s.id === source) + 1) % SOURCES.length];
+
   const genreItems = ranking || !state.genres.length ? []
     : [{ value: '', label: source === 'xifan' ? '推荐' : '全部' }].concat(state.genres.map(g => ({ value: g.slug, label: g.label })));
 
@@ -80,7 +83,8 @@ export function Browse() {
         {state.loading && state.items.length === 0 && <PosterSkeleton />}
         {state.loading && state.items.length > 0 && <Spinner label="加载更多…" />}
         {!state.loading && state.error && (
-          <Empty title="目录暂时加载不了" message={state.error} onAction={() => load(state.items.length ? state.page + 1 : 1, true)} />
+          <Empty title="目录暂时加载不了" message={state.error} onAction={() => load(state.items.length ? state.page + 1 : 1, true)}
+            {...(fallback && !state.items.length ? { secondaryLabel: '改看' + fallback.label, onSecondary: () => changeSource(fallback.id) } : null)} />
         )}
         {!state.loading && !state.error && state.items.length === 0 && (
           <Empty title="这里还没有内容" message={state.empty || '换个分类或题材看看。'} onAction={() => load(1, true)} actionLabel="刷新" />
