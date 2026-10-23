@@ -5,9 +5,16 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { md5, sha512, sm3, Aes128, aes128CbcDecrypt, cencCtrInPlace } from '../src/lib/crypto.js';
 import { toBase64, fromBase64, fromHex, toHex, add64, rotr64, u64 } from '../src/lib/bytes.js';
-import { decryptMp4 } from '../src/media/cenc.js';
+import { decryptMp4, clearVideoType } from '../src/media/cenc.js';
 
 const hex = b => Buffer.from(b).toString('hex');
+const box = (type, ...children) => {
+  const body = Buffer.concat(children.map(c => Buffer.from(c)));
+  const head = Buffer.alloc(8);
+  head.writeUInt32BE(8 + body.length, 0);
+  head.write(type, 4, 'latin1');
+  return Buffer.concat([head, body]);
+};
 
 test('md5 / sha512 match node', () => {
   for (const n of [0, 1, 55, 56, 63, 64, 111, 112, 127, 128, 999]) {
@@ -66,4 +73,17 @@ test('cenc decrypt of real App episode decodes cleanly', { skip: !fs.existsSync(
   assert.match(probe, /aac,mp4a/);
   const errs = execFileSync('ffmpeg', ['-v', 'error', '-i', file, '-t', '5', '-f', 'null', '-'], { stdio: ['ignore', 'pipe', 'pipe'] }).toString();
   assert.equal(errs.trim(), '');
+});
+
+test('an encrypted video entry keeps its real codec', () => {
+  const type = (...boxes) => { const d = new Uint8Array(Buffer.concat(boxes)); return clearVideoType(d, 0, d.length); };
+  const sinf = original => box('sinf', box('frma', original), box('schm', Buffer.alloc(8)));
+  assert.equal(type(box('avcC', Buffer.alloc(4)), sinf('avc1')), 'avc1');
+  assert.equal(type(box('hvcC', Buffer.alloc(4)), sinf('hvc1')), 'hvc1');
+  // Without frma the config box decides, so H.264 is not labelled HEVC.
+  assert.equal(type(box('avcC', Buffer.alloc(4))), 'avc1');
+  assert.equal(type(box('hvcC', Buffer.alloc(4))), 'hvc1');
+  assert.throws(() => type(box('hvcC', Buffer.alloc(4)), sinf('avc1')), /原始编码/);
+  assert.throws(() => type(box('avcC', Buffer.alloc(4)), box('hvcC', Buffer.alloc(4))), /原始编码/);
+  assert.throws(() => type(sinf('vp09')), /原始编码/);
 });

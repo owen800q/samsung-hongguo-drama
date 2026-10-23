@@ -162,6 +162,8 @@ h1, h2, p { margin: 0; }
 .status > * + * { margin-top: 20px; }
 .status-title { font-size: 34px; font-weight: 600; color: var(--text); }
 .status-text { font-size: 24px; color: var(--muted); max-width: 1100px; }
+.status-actions { display: flex; align-items: center; }
+.status-actions .btn + .btn { margin-left: 24px; }
 .error-boundary { display: flex; align-items: center; justify-content: center; }
 .error-boundary .status-text { max-width: 900px; line-height: 1.6; }
 .error-boundary .btn { margin-top: 44px; }

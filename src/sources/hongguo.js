@@ -75,12 +75,14 @@ export function pickWebMedia(html, vid, sid) {
   if (!data || data.isSuccess === false || String(data.vid) !== String(vid) || !/^\d+$/.test(actualSid) ||
       (sid && actualSid !== String(sid)) || String(data.seriesDetail && data.seriesDetail.series_id) !== actualSid ||
       !seo || seo.available !== true || String(seo.itemId) !== String(vid) || String(seo.seriesId) !== actualSid) return '';
-  const matchesPlayer = value => {
+  const matchesPlayer = (value, media) => {
     try {
       const target = new URL(value);
-      // The first episode's page names the series URL as its canonical address.
       return target.origin === SITE && !target.username && !target.password &&
-        (target.pathname === '/player/' + actualSid + '/' + String(vid) || target.pathname === '/player/' + actualSid);
+        (target.pathname === '/player/' + actualSid + '/' + String(vid) ||
+          // The canonical series URL omits vid, so the site's own media path must name this episode.
+          (target.pathname === '/player/' + actualSid && media.origin === SITE &&
+            media.pathname.indexOf('/video/public/' + String(vid) + '/') === 0));
     } catch (_) { return false; }
   };
   const scripts = /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi;
@@ -89,10 +91,11 @@ export function pickWebMedia(html, vid, sid) {
     if (!/\btype\s*=\s*["']application\/ld\+json["']/i.test(m[1])) continue;
     let video;
     try { video = JSON.parse(m[2]); } catch (_) { continue; }
-    if (!video || video['@type'] !== 'VideoObject' || !matchesPlayer(video.url) ||
-        (video['@id'] && !matchesPlayer(video['@id']))) continue;
+    if (!video || video['@type'] !== 'VideoObject') continue;
     const url = mediaUrl(normalizeVideoUrl(video.contentUrl));
-    if (url) return url;
+    if (!url) continue;
+    const media = new URL(url);
+    if (matchesPlayer(video.url, media) && (!video['@id'] || matchesPlayer(video['@id'], media))) return url;
   }
   return '';
 }

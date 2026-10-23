@@ -120,6 +120,10 @@ export function findNext(from, dir, candidates) {
   return best;
 }
 
+function inSidebar(el) {
+  return !!el.closest('.sidebar');
+}
+
 /** Move focus; returns false when nothing lies in that direction. */
 export function move(dir) {
   const from = current();
@@ -131,8 +135,13 @@ export function move(dir) {
     const target = activeScope().querySelector(explicit);
     if (target) return focusElement(target);
   }
-  const next = findNext(from, dir, candidates);
+  let next = findNext(from, dir, candidates);
   if (!next) return false;
+  // Up/down stays in the content column while it has something that way (an off-centre
+  // retry button would otherwise lose to a nearby sidebar icon); Left reaches the sidebar.
+  if ((dir === 'up' || dir === 'down') && inSidebar(next) && !inSidebar(from)) {
+    next = findNext(from, dir, candidates.filter(el => !inSidebar(el))) || next;
+  }
   const fromGroup = groupOf(from);
   const toGroup = groupOf(next);
   if (toGroup && toGroup !== fromGroup && restoreGroup(toGroup.getAttribute('data-focus-group'))) return true;

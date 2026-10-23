@@ -245,6 +245,22 @@ try {
   await crash.waitForSelector('.poster.focusable', { timeout: 30000 }).catch(() => {});
   check('OK on the recovery prompt reloads the app', !!(await crash.$('.poster.focusable')) && !(await crash.$('.error-boundary')));
   await crash.close();
+
+  // 红果 unreachable (its site resets connections): the catalog error offers the next source.
+  const down = await ctx.newPage();
+  await down.route(/hongguoduanju\.com/, route => route.abort('connectionreset'));
+  await down.goto(URL_);
+  await down.waitForSelector('.status-empty .btn', { timeout: 30000 }).catch(() => {});
+  const downFocused = () => down.evaluate(() => { const a = document.activeElement; return a && a !== document.body ? (a.textContent || '').trim() : ''; });
+  for (let i = 0; i < 6 && !/重试/.test(await downFocused()); i++) { await down.keyboard.press('ArrowDown'); await down.waitForTimeout(300); }
+  await down.keyboard.press('ArrowRight'); await down.waitForTimeout(300);
+  check('a failed 红果 catalog offers switching source, reachable with the remote', /改看西饭/.test(await downFocused()), await downFocused());
+  await down.keyboard.press('Enter');
+  await down.waitForSelector('.poster.focusable', { timeout: 30000 }).catch(() => {});
+  const switched = await down.evaluate(() => ({ posters: document.querySelectorAll('.poster.focusable').length,
+    tab: ((document.querySelector('[data-focus-group="browse-source"] .is-selected') || {}).textContent || '').trim() }));
+  check('switching from the error loads the 西饭 catalog', switched.posters > 0 && switched.tab === '西饭', JSON.stringify(switched));
+  await down.close();
 } catch (e) {
   check('e2e run completed', false, String(e && e.stack || e));
   await page.screenshot({ path: path.join(os.tmpdir(), 'hgtv-e2e-failure.png') }).catch(() => {});
