@@ -8,6 +8,23 @@ useNodeTransport();
 const retry = async fn => { try { return await fn(); } catch (e) { await new Promise(r => setTimeout(r, 1500)); return fn(); } };
 const okList = r => { assert.ok(r.success, r.error); assert.ok(r.results.length > 0); return r; };
 
+// Series marked protectedPlayback only expose a ~10 s preview on the website, so their first
+// episode must come from the App source. Prefer a series the website really serves; since
+// late 2026 the site protects nearly every series, so the App fallback is checked instead.
+async function firstEpisodeSeries(results, skip = 0) {
+  let fallback = null;
+  for (const item of results.slice(skip, skip + 8)) {
+    const s = await retry(() => fetchSeries(item.series_id));
+    if (s.episodes.length <= 10) continue;
+    const info = await retry(() => getPlayInfo(s.episodes[0].vid, s.series_id));
+    if (info.contentKey === null) return { s, web: true };
+    assert.match(info.contentKey, /^[0-9a-f]{32}$/, 'a protected first episode falls back to the App source');
+    fallback = fallback || s;
+  }
+  assert.ok(fallback, 'needs a series with >10 episodes');
+  return { s: fallback, web: false };
+}
+
 test('hongguo catalog + ranking', async () => {
   const r = okList(await retry(async () => okList(await browseList({ source: 'hongguo', category: 'real-drama', page: 1 }))));
   assert.ok(r.genres.length > 0 && r.hasMore && r.nextPage === 2);
@@ -22,11 +39,10 @@ test('hongguo search', async () => {
 
 test('hongguo series + web and app play info', async () => {
   const list = await retry(async () => okList(await browseList({ source: 'hongguo', category: 'real-drama' })));
-  const s = await retry(() => fetchSeries(list.results[0].series_id));
-  assert.ok(s.episodes.length > 10, 'needs >10 episodes');
+  const { s, web: public_ } = await firstEpisodeSeries(list.results);
   const web = await retry(() => getPlayInfo(s.episodes[0].vid, s.series_id));
   assert.match(web.url, /^https:/);
-  assert.equal(web.contentKey, null);
+  assert.equal(web.contentKey === null, public_);
   const app = await retry(() => getPlayInfo(s.episodes[9].vid, s.series_id));
   assert.match(app.url, /^https:/);
   assert.match(app.contentKey, /^[0-9a-f]{32}$/);
@@ -60,10 +76,10 @@ test('search all sources tolerates partial failure', async () => {
 test('playback: direct URL and decrypted blob', async () => {
   const { resolvePlayback, release } = await import('../src/media/playback.js');
   const list = await retry(async () => okList(await browseList({ source: 'hongguo', category: 'real-drama' })));
-  const s = await retry(() => fetchSeries(list.results[1].series_id));
+  const { s, web } = await firstEpisodeSeries(list.results, 1);
   const direct = await retry(() => resolvePlayback(s.episodes[0].vid, s.series_id));
-  assert.equal(direct.encrypted, false);
-  assert.match(direct.src, /^https:/);
+  assert.equal(direct.encrypted, !web);
+  assert.match(direct.src, web ? /^https:/ : /^blob:/);
   const phases = new Set();
   const enc = await retry(() => resolvePlayback(s.episodes[9].vid, s.series_id, { onProgress: p => phases.add(p) }));
   assert.equal(enc.encrypted, true);
@@ -76,6 +92,7 @@ test('playback: direct URL and decrypted blob', async () => {
   assert.equal(fresh.encrypted, true);
   assert.notEqual(fresh.src, enc.src);
   release(s.episodes[9].vid);
+  release(s.episodes[0].vid);
 });
 
 test('playback: prefetch hands off to the player and cancels when abandoned', async () => {
