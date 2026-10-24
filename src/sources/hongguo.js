@@ -65,7 +65,7 @@ export function fetchEpisodeList(seriesId, options = {}) {
 /**
  * The clear MP4 of exactly this episode from a player page, or ''. The page also lists
  * recommended videos, so the address must come from the VideoObject bound to this
- * player, and the page model must confirm the episode is publicly playable.
+ * player, and the page model must confirm the episode is publicly playable and not protected.
  */
 export function pickWebMedia(html, vid, sid) {
   let data;
@@ -74,7 +74,9 @@ export function pickWebMedia(html, vid, sid) {
   const seo = data && data.publicVideoSeo;
   if (!data || data.isSuccess === false || String(data.vid) !== String(vid) || !/^\d+$/.test(actualSid) ||
       (sid && actualSid !== String(sid)) || String(data.seriesDetail && data.seriesDetail.series_id) !== actualSid ||
-      !seo || seo.available !== true || String(seo.itemId) !== String(vid) || String(seo.seriesId) !== actualSid) return '';
+      !seo || seo.available !== true || String(seo.itemId) !== String(vid) || String(seo.seriesId) !== actualSid ||
+      // A protected page's public file is a ~10 s preview, even when its metadata claims the full length.
+      data.protectedPlayback === true) return '';
   const matchesPlayer = (value, media) => {
     try {
       const target = new URL(value);

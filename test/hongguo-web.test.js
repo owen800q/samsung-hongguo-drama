@@ -40,6 +40,9 @@ test('web media is rejected when the page is not this public episode', () => {
   assert.equal(pickWebMedia(page({ videos: [own] }), VID, '123'), '');
   assert.equal(pickWebMedia(page({ videos: [own], model: { isSuccess: false } }), VID, SID), '');
   assert.equal(pickWebMedia(page({ videos: [own], model: { publicVideoSeo: { available: false, seriesId: SID, itemId: VID } } }), VID, SID), '');
+  // A protected page's public file is only a short preview.
+  assert.equal(pickWebMedia(page({ videos: [own], model: { protectedPlayback: true } }), VID, SID), '');
+  assert.equal(pickWebMedia(page({ videos: [own], model: { protectedPlayback: false } }), VID, SID), 'https://hongguoduanju.com/video/public/' + VID + '/360p.mp4');
   assert.equal(pickWebMedia(page({ videos: [video(PLAYER, 'javascript:alert(1)')] }), VID, SID), '');
   assert.equal(pickWebMedia(page({ videos: [video(PLAYER, 'https://u:p@cdn.example.com/a.mp4')] }), VID, SID), '');
   assert.equal(pickWebMedia('<html>no data</html>', VID, SID), '');

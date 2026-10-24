@@ -78,11 +78,11 @@ export function Player({ series, index: startIndex, fromStart }) {
   const loadedEpisode = useRef(null);
   // Where that media came from ('web' is the 红果 website's CDN).
   const loadedSource = useRef('');
-  function save() {
+  function save(ended) {
     const v = video.current;
     const ep = loadedEpisode.current;
     if (!v || !ep || !(v.currentTime > 0)) return;
-    recordProgress(series, ep, v.currentTime, v.duration || 0);
+    recordProgress(series, ep, v.currentTime, v.duration || 0, ended === true);
   }
 
   // ---------- load an episode ----------
@@ -174,7 +174,7 @@ export function Player({ series, index: startIndex, fromStart }) {
         if (d && d - v.currentTime < 6 && settings.current.autoNext && nextRef.current >= 0) setUpNext(true);
       }),
       on('ended', () => {
-        save();
+        save(v.ended);
         setScreenSaver(true);
         if (settings.current.autoNext && nextRef.current >= 0) setIndex(nextRef.current);
         else { setStatus('ended'); showOsd(true); }

@@ -67,7 +67,7 @@ function meta(series) {
 }
 
 // ---------- watch history ----------
-/** [{ ...meta, vid, vid_index, position, duration, updatedAt }] newest first. */
+/** [{ ...meta, vid, vid_index, position, duration, updatedAt, completedEpisode? }] newest first. */
 export function getHistory() {
   const list = read('history', []);
   return Array.isArray(list) ? list.filter(x => x && x.series_id) : [];
@@ -77,17 +77,25 @@ export function getHistoryEntry(seriesId) {
   return getHistory().find(x => x.series_id === String(seriesId)) || null;
 }
 
-export function recordProgress(series, episode, position, duration) {
+/** `ended`: the video fired its ended event, the only evidence that an episode was finished. */
+export function recordProgress(series, episode, position, duration, ended) {
   const list = getHistory().filter(x => x.series_id !== String(series.series_id));
+  const prev = getHistoryEntry(series.series_id);
+  const total = Math.max(meta(series).total, (series.episodes && series.episodes.length) || 0);
   const entry = Object.assign(meta(series), {
+    total,
     vid: String(episode.vid),
     vid_index: Number(episode.vid_index) || 0,
     position: Math.max(0, Math.floor(position || 0)),
     duration: Math.max(0, Math.floor(duration || 0)),
     updatedAt: Date.now(),
   });
+  // Watching the last episode to its end finishes the series; replaying earlier ones keeps that.
+  const index = Number(episode.vid_index) || 0;
+  const atEnd = ended === true && duration > 0 && isFinite(duration) && position >= duration - Math.min(1, duration * 0.01);
+  const done = Math.max(prev && prev.completedEpisode > 0 ? prev.completedEpisode : 0, atEnd && total > 0 && index === total ? index : 0);
+  if (done) entry.completedEpisode = done;
   // Remember per-episode positions for the last few episodes so revisiting resumes.
-  const prev = getHistoryEntry(series.series_id);
   const positions = Object.assign({}, prev && prev.positions);
   positions[entry.vid] = entry.position;
   const keys = Object.keys(positions);
@@ -97,6 +105,12 @@ export function recordProgress(series, episode, position, duration) {
   write('history', list.slice(0, MAX_HISTORY));
   emit('history');
   return entry;
+}
+
+/** Finished up to the latest known episode; `knownTotal` is a newer count (追剧 refresh). */
+export function isCompleted(entry, knownTotal) {
+  const total = Math.max(Number(entry && entry.total) || 0, Number(knownTotal) || 0);
+  return total > 0 && entry.completedEpisode >= total;
 }
 
 export function removeHistory(seriesId) {

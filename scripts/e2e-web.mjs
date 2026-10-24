@@ -84,6 +84,15 @@ await page.route(/hongguoduanju\.com\/video\//, route => {
     headers: { 'accept-ranges': 'bytes', 'content-range': `bytes ${start}-${end}/${clip.length}` } });
 });
 
+// Protected 红果 pages only expose a preview, so the player skips them. The main run needs a
+// website episode to drive, so its pages are unprotected; a separate page checks the fallback.
+await page.route(/hongguoduanju\.com\/player\/[^?]*\/\d+/, async route => {
+  try {
+    const res = await route.fetch();
+    await route.fulfill({ response: res, body: (await res.text()).replace(/"protectedPlayback":true/g, '"protectedPlayback":false') });
+  } catch (_) { /* request outlived the page */ }
+});
+
 try {
   await page.goto(URL_);
   await page.waitForSelector('.poster.focusable', { timeout: 30000 });
@@ -261,6 +270,88 @@ try {
     tab: ((document.querySelector('[data-focus-group="browse-source"] .is-selected') || {}).textContent || '').trim() }));
   check('switching from the error loads the 西饭 catalog', switched.posters > 0 && switched.tab === '西饭', JSON.stringify(switched));
   await down.close();
+
+  // 观看记录: the 全部/未看完/已看完 filter works with the remote, and red deletes from the filtered grid.
+  const hist = await ctx.newPage();
+  await hist.addInitScript(() => {
+    if (sessionStorage.getItem('seeded')) return;
+    sessionStorage.setItem('seeded', '1');
+    const now = Date.now();
+    localStorage.setItem('hg.history', JSON.stringify([
+      { series_id: '1', series_title: '没看完的剧', total: 5, vid: 'a', vid_index: 2, position: 30, duration: 60, updatedAt: now },
+      { series_id: '2', series_title: '看完的剧', total: 3, vid: 'b', vid_index: 3, position: 60, duration: 60, updatedAt: now - 1000, completedEpisode: 3 },
+      { series_id: '3', series_title: '更新了的剧', total: 3, vid: 'c', vid_index: 3, position: 60, duration: 60, updatedAt: now - 2000, completedEpisode: 3 },
+    ]));
+    localStorage.setItem('hg.favorites', JSON.stringify([
+      { series_id: '3', series_title: '更新了的剧', total: 4, seenTotal: 3, addedAt: now, checkedAt: now },
+    ]));
+  });
+  await hist.addInitScript(() => { window.tizen = { tvinputdevice: { registerKey() {} } }; });
+  await hist.goto(URL_);
+  await hist.waitForSelector('.sidebar-item', { timeout: 30000 });
+  await hist.evaluate(() => document.querySelector('[data-sidebar-tab="history"]').focus());
+  await hist.keyboard.press('Enter');
+  await hist.waitForSelector('[data-focus-group="history-filter"]', { timeout: 10000 }).catch(() => {});
+  await hist.waitForTimeout(500);
+  const histState = () => hist.evaluate(() => ({
+    chips: Array.from(document.querySelectorAll('[data-focus-group="history-filter"] .chip')).map(c => c.textContent.trim()),
+    titles: Array.from(document.querySelectorAll('[data-focus-group="history-grid"] .poster-title')).map(t => t.textContent),
+    badges: Array.from(document.querySelectorAll('[data-focus-group="history-grid"] .poster-badge')).map(t => t.textContent),
+    focused: (document.activeElement.textContent || '').trim(),
+  }));
+  let hs = await histState();
+  check('history shows 全部/未看完/已看完 counts; new episodes count as unfinished', hs.chips.join(',') === '全部 3,未看完 2,已看完 1', JSON.stringify(hs.chips));
+  const histFocused = () => hist.evaluate(() => (document.activeElement.textContent || '').trim());
+  for (let i = 0; i < 4 && !/^全部/.test(await histFocused()); i++) { await hist.keyboard.press('ArrowUp'); await hist.waitForTimeout(300); }
+  for (let i = 0; i < 3 && !/^已看完/.test(await histFocused()); i++) { await hist.keyboard.press('ArrowRight'); await hist.waitForTimeout(300); }
+  await hist.keyboard.press('Enter'); await hist.waitForTimeout(400);
+  hs = await histState();
+  check('the 已看完 filter is reachable with the remote and shows only finished series', hs.titles.join() === '看完的剧' && hs.badges.join() === '已看完', JSON.stringify(hs));
+  await hist.keyboard.press('ArrowDown'); await hist.waitForTimeout(300);
+  check('down from the filter moves onto the filtered grid', /看完的剧/.test(await histFocused()), await histFocused());
+  await hist.evaluate(() => {
+    const e = new KeyboardEvent('keydown', { bubbles: true, cancelable: true });
+    Object.defineProperty(e, 'keyCode', { get: () => 403 });
+    document.activeElement.dispatchEvent(e);
+  });
+  await hist.waitForTimeout(400);
+  hs = await histState();
+  const left = await hist.evaluate(() => JSON.parse(localStorage.getItem('hg.history')).map(x => x.series_title).join());
+  check('red key deletes the focused entry of the filtered grid', left === '没看完的剧,更新了的剧' && hs.chips.join(',') === '全部 2,未看完 2,已看完 0', left + ' ' + hs.chips.join(','));
+  const emptyAll = await hist.evaluate(() => { const b = Array.from(document.querySelectorAll('.status-empty .btn')).find(x => /查看全部/.test(x.textContent)); return !!b; });
+  check('an empty filter offers 查看全部', emptyAll);
+  await hist.close();
+
+  // A protected 红果 page only exposes a ~10 s preview: playback must use the App source instead.
+  const prot = await ctx.newPage();
+  await prot.addInitScript(() => { window.tizen = { tvinputdevice: { registerKey() {} }, application: { getCurrentApplication: () => ({ exit() {} }) } }; });
+  const protMedia = [];
+  let protPages = 0;
+  await prot.route(/hongguoduanju\.com\/video\//, route => { protMedia.push(route.request().url()); return route.abort(); });
+  await prot.route(/hongguoduanju\.com\/player\/[^?]*\/\d+/, async route => {
+    try {
+      const res = await route.fetch();
+      const body = (await res.text()).replace(/"protectedPlayback":(true|false),?/g, '').replace(/"publicVideoSeo":/g, '"protectedPlayback":true,"publicVideoSeo":');
+      if (body.indexOf('"protectedPlayback":true') >= 0) protPages++;
+      await route.fulfill({ response: res, body });
+    } catch (_) { /* a next-episode prefetch still in flight when the page closes */ }
+  });
+  await prot.goto(URL_);
+  await prot.waitForSelector('.poster.focusable', { timeout: 30000 });
+  await prot.evaluate(() => document.querySelector('.poster.focusable').focus());
+  await prot.keyboard.press('Enter');
+  await prot.waitForSelector('.detail .btn-primary:not([disabled])', { timeout: 30000 });
+  await prot.waitForTimeout(600);
+  await prot.keyboard.press('Enter');
+  const protEnd = Date.now() + 120000;
+  let protSrc = '';
+  while (Date.now() < protEnd && !/^blob:/.test(protSrc)) {
+    await prot.waitForTimeout(500);
+    protSrc = await prot.evaluate(() => { const v = document.querySelector('video.player-video'); return v ? v.currentSrc || v.src : ''; });
+    if (await prot.$('.player-error')) break;
+  }
+  check('a protected preview page falls back to the App source', protPages > 0 && /^blob:/.test(protSrc) && protMedia.length === 0, protSrc + ' protected pages: ' + protPages + ', web hits: ' + protMedia.length);
+  await prot.close();
 } catch (e) {
   check('e2e run completed', false, String(e && e.stack || e));
   await page.screenshot({ path: path.join(os.tmpdir(), 'hgtv-e2e-failure.png') }).catch(() => {});
