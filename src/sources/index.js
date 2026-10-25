@@ -4,6 +4,7 @@ import * as catalog from './catalog.js';
 import * as hongguo from './hongguo.js';
 import * as xifan from './xifan.js';
 import * as hema from './hema.js';
+import { findSequels, rankResults, seasonTitle, supplementQueries } from './seasons.js';
 
 export const SOURCES = [
   { id: 'hongguo', label: '红果' },
@@ -74,6 +75,25 @@ function interleave(lists) {
   return out;
 }
 
+async function searchSources(kw, ids, page) {
+  const settled = await Promise.all(ids.map(id =>
+    ADAPTERS[id].search(kw, page).catch(error => ({ success: false, error: error.message }))
+      .then(res => ({ id, res }))));
+  const ok = settled.filter(x => x.res.success);
+  return {
+    ok: ok.map(x => x.id),
+    results: interleave(ok.map(x => (x.res.results || []).map(r => Object.assign({ source: x.id }, r)))),
+    hasMore: ok.some(x => x.res.hasMore),
+    errors: settled.filter(x => !x.res.success).map(x => ({ source: x.id, error: x.res.error || '搜索失败' })),
+  };
+}
+
+/**
+ * Searches the chosen sources. On the first page a series name that matches a season title
+ * ("剧名第二季") also searches for the lowest missing later season (at most two extra
+ * searches, see seasons.js); results are deduplicated and ranked by title match.
+ * `options.afterSeason` starts that season search after a known season.
+ */
 export async function search(keyword, options = {}) {
   const kw = String(keyword || '').trim();
   if (!kw) return { success: false, results: [], hasMore: false, nextPage: null, errors: [], error: '请输入搜索关键词' };
@@ -81,25 +101,52 @@ export async function search(keyword, options = {}) {
   const wanted = !options.source || options.source === 'all' ? SOURCES.map(s => s.id) : [options.source];
   // Hongguo's website only renders the first page of search results.
   const ids = page > 1 ? wanted.filter(id => id !== 'hongguo') : wanted;
-  const settled = await Promise.all(ids.map(id =>
-    ADAPTERS[id].search(kw, page).catch(error => ({ success: false, error: error.message }))
-      .then(res => ({ id, res }))));
-  const errors = settled.filter(x => !x.res.success).map(x => ({ source: x.id, error: x.res.error || '搜索失败' }));
-  const ok = settled.filter(x => x.res.success);
-  let results = interleave(ok.map(x => x.res.results || []));
-  const hasMore = ok.some(x => x.res.hasMore);
+  const primary = await searchSources(kw, ids, page);
+  let results = primary.results;
+  const supplementErrors = [];
+  if (page === 1 && primary.ok.length) {
+    // Only the sources that answered; one that already failed is reported once, in `errors`.
+    for (const query of supplementQueries(kw, results, options.known, options.afterSeason)) {
+      const extra = await searchSources(query, primary.ok, 1);
+      results = results.concat(extra.results);
+      extra.errors.forEach(e => supplementErrors.push(e));
+    }
+  }
+  results = rankResults(results, kw);
 
   if (page === 1 && wanted.indexOf('hongguo') >= 0 && /^\d{6,30}$/.test(kw) && !results.some(r => r.series_id === kw)) {
     try {
       const s = await hongguo.fetchEpisodeList(kw);
-      results = [{ series_id: s.series_id, series_title: s.series_title, cover: s.cover, episode_count: s.total, tags: s.tags || [], intro: s.intro, source: 'hongguo' }].concat(results);
+      results = [{ series_id: s.series_id, series_title: s.series_title, cover: s.cover, episode_count: s.total, tags: s.tags || [], intro: s.intro, source: 'hongguo', relevance: 0 }].concat(results);
     } catch (_) { /* not a valid id: keep text results */ }
   }
-  const success = ok.length > 0 || results.length > 0;
+  const success = primary.ok.length > 0 || results.length > 0;
+  const errors = primary.errors;
   return {
-    success, results, page, hasMore, nextPage: hasMore ? page + 1 : null, errors,
+    success, results, page, hasMore: primary.hasMore, nextPage: primary.hasMore ? page + 1 : null, errors,
+    partial: supplementErrors.length > 0, supplementErrors,
     error: success ? undefined : (errors[0] && errors[0].error) || '搜索失败，请重试',
   };
+}
+
+/**
+ * Possible later seasons of a series, from its own source only: `local` (watch history and
+ * 追剧 entries) plus a search for the base title. Candidates are for the user to check;
+ * nothing is played automatically. A failed search keeps the local candidates.
+ */
+export async function findNextSeasons(series, local = []) {
+  const parsed = seasonTitle(series && series.series_title);
+  if (!parsed.base || parsed.invalid || parsed.season > 99) return { success: false, results: [], error: '剧名或季数无法识别，请按完整剧名搜索。' };
+  const known = findSequels(series, local, sourceOf);
+  try {
+    const res = await search(parsed.base, { source: sourceOf(series.series_id), afterSeason: parsed.season, known: [series].concat(known) });
+    if (!res.success) throw new Error(res.error || '来源搜索失败');
+    const results = findSequels(series, known.concat(res.results), sourceOf);
+    return res.partial ? { success: true, results, partial: true, error: '补充搜索未完成，可稍后重试。' } : { success: true, results };
+  } catch (error) {
+    return { success: known.length > 0, results: known, partial: true,
+      error: '联网查找未完成：' + (error.message || '来源搜索失败') + (known.length ? '；已保留本机记录中的候选。' : '；可稍后重试。') };
+  }
 }
 
 export async function fetchSeries(seriesId, options = {}) {

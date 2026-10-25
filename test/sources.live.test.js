@@ -2,7 +2,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { useNodeTransport } from './node-transport.js';
-import { browseList, search, fetchSeries, getPlayInfo, browseCategories } from '../src/sources/index.js';
+import { browseList, search, fetchSeries, getPlayInfo, browseCategories, findNextSeasons } from '../src/sources/index.js';
+import { seasonTitle } from '../src/sources/seasons.js';
 
 useNodeTransport();
 const retry = async fn => { try { return await fn(); } catch (e) { await new Promise(r => setTimeout(r, 1500)); return fn(); } };
@@ -46,6 +47,24 @@ test('hongguo series + web and app play info', async () => {
   const app = await retry(() => getPlayInfo(s.episodes[9].vid, s.series_id));
   assert.match(app.url, /^https:/);
   assert.match(app.contentKey, /^[0-9a-f]{32}$/);
+});
+
+test('season search and 查找下一季 on a multi-season series', async () => {
+  // Any 西饭 season-2 title; its source then decides whether later seasons exist.
+  const pool = await retry(async () => okList(await search('第二季', { source: 'xifan' })));
+  const second = pool.results.find(x => seasonTitle(x.series_title).season === 2);
+  assert.ok(second, 'needs a season-2 title');
+  const base = seasonTitle(second.series_title).base;
+  const r = await retry(async () => okList(await search(base, { source: 'xifan' })));
+  const tiers = r.results.map(x => x.relevance);
+  assert.deepEqual(tiers, tiers.slice().sort(), 'title matches come first');
+  assert.ok(r.results.some(x => x.series_id === second.series_id), 'the season search finds season 2 from its bare name');
+  const next = await retry(() => findNextSeasons(second));
+  assert.ok(next.success, next.error);
+  for (const x of next.results) {
+    const t = seasonTitle(x.series_title);
+    assert.ok(t.base === base && t.season > 2 && x.series_id.indexOf('xifan:') === 0, x.series_title);
+  }
 });
 
 test('xifan browse/search/series', async () => {

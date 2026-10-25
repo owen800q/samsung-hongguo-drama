@@ -291,3 +291,5 @@ h1, h2, p { margin: 0; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation-duration: 0.01ms !important; }
 }
+.detail-sequels .chip-wrap { margin-top: 16px; }
+.detail-sequels .chip { display: inline-block; line-height: 56px; max-width: 560px; overflow: hidden; text-overflow: ellipsis; }
