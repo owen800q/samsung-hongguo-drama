@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { useRouter, useActive } from '../router.js';
-import { fetchSeries } from '../sources/index.js';
-import { getHistoryEntry, isFavorite, toggleFavorite, updateFavorite, subscribe } from '../lib/storage.js';
+import { fetchSeries, findNextSeasons } from '../sources/index.js';
+import { getFavorites, getHistory, getHistoryEntry, isFavorite, toggleFavorite, updateFavorite, subscribe } from '../lib/storage.js';
 import { SOURCE_LABEL, errorMessage } from '../lib/format.js';
 import { Icon } from '../components/Icon.jsx';
 import { Empty, Spinner } from '../components/Status.jsx';
@@ -20,6 +20,9 @@ export function Detail({ series: initial }) {
   const [range, setRange] = useState(0);
   const [coverBroken, setCoverBroken] = useState(false);
   const loaded = useRef(false);
+  // 查找下一季: null = not asked; candidates are listed for the user to pick, never auto-played.
+  const [sequels, setSequels] = useState(null);
+  const sequelRequest = useRef(0);
 
   function load(force) {
     setError('');
@@ -58,6 +61,18 @@ export function Detail({ series: initial }) {
     router.push('player', { series: data, index, fromStart: !!fromStart });
   }
 
+  function findSequels() {
+    if (sequels && sequels.loading) return;
+    const id = ++sequelRequest.current;
+    const series = { series_id: view.series_id, series_title: view.series_title };
+    setSequels({ loading: true, results: [], error: '' });
+    findNextSeasons(series, getHistory().concat(getFavorites())).then(res => {
+      if (id !== sequelRequest.current) return;
+      setSequels({ loading: false, results: res.results || [], error: res.error || '', failed: !res.success || !!res.partial });
+    });
+  }
+  useEffect(() => () => { sequelRequest.current++; }, []);
+
   function onFavorite() {
     const on = toggleFavorite(Object.assign({}, view, { total }));
     setFav(on);
@@ -95,7 +110,25 @@ export function Detail({ series: initial }) {
             <button type="button" tabIndex={-1} class={'btn btn-lg focusable' + (fav ? ' is-on' : '')} onClick={onFavorite}>
               <Icon name={fav ? 'heartFill' : 'heart'} />{fav ? '已追剧' : '追剧'}
             </button>
+            {/* Not disabled while searching: a disabled button would drop the remote's focus. */}
+            <button type="button" tabIndex={-1} class="btn btn-lg focusable" disabled={!view.series_title} onClick={findSequels}>
+              <Icon name="search" />{sequels && sequels.loading ? '正在查找…' : sequels ? (sequels.failed && !sequels.results.length ? '重试' : '重新查找') : '查找下一季'}
+            </button>
           </div>
+          {sequels && !sequels.loading && (
+            <div class="detail-sequels" role="status">
+              <p class="detail-note">{sequels.results.length ? '可能的续作，请核对剧名后选择' + (sequels.error ? '（' + sequels.error + '）' : '')
+                : sequels.failed ? sequels.error || '查询未完成，暂时无法判断是否有下一季。' : '暂未找到下一季，可稍后再查。'}</p>
+              {sequels.results.length > 0 && (
+                <div class="chip-wrap" data-focus-group="detail-sequels">
+                  {sequels.results.map(item => (
+                    <button key={item.series_id} type="button" tabIndex={-1} class="chip focusable"
+                      onClick={() => router.push('detail', { series: item })}>{item.series_title}</button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           {webLimit && <p class="detail-note">官网公开前 {data.web_accessible_episodes} 集；其余分集将尝试备用片源，首次打开需要稍候。</p>}
         </div>
       </div>

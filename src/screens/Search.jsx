@@ -11,6 +11,14 @@ import { focusElement, focusFirst } from '../lib/focus.js';
 
 const SOURCE_ITEMS = [{ value: 'all', label: '全部来源' }].concat(SOURCES.map(s => ({ value: s.id, label: s.label })));
 
+// Sources also return loosely related series; those are ranked after the title matches.
+function matchSummary(items) {
+  const other = items.filter(x => x.relevance === 2).length;
+  if (!other) return '';
+  const matched = items.length - other;
+  return matched ? '：' + matched + ' 部标题匹配，另有 ' + other + ' 部其他结果排在后面' : '：没有标题匹配的剧，以下是来源返回的其他结果';
+}
+
 export function Search() {
   const router = useRouter();
   const input = useRef(null);
@@ -32,8 +40,10 @@ export function Search() {
     setState(s => Object.assign({}, s, { keyword: kw, loading: true, error: '' }, page === 1 ? { items: [], page: 0, hasMore: false, notes: [] } : null));
     search(kw, { source, page }).then(res => {
       if (id !== request.current) return;
-      const notes = (res && res.errors || []).map(e => (SOURCE_LABEL[e.source] || e.source) + '：' + e.error);
-      if (!res || (!res.success && !(res.results || []).length)) throw new Error((res && res.error) || notes.join('；') || '搜索失败');
+      const failed = (res && res.errors || []).map(e => (SOURCE_LABEL[e.source] || e.source) + '：' + e.error);
+      const notes = failed.length ? ['部分来源失败：' + failed.join('；')] : [];
+      if (res && res.partial) notes.push('补充搜索后续季未完成，已显示本次查到的结果');
+      if (!res || (!res.success && !(res.results || []).length)) throw new Error((res && res.error) || failed.join('；') || '搜索失败');
       setState(s => {
         const seen = new Set(page === 1 ? [] : s.items.map(x => x.series_id));
         const fresh = (res.results || []).filter(x => !seen.has(x.series_id));
@@ -114,7 +124,7 @@ export function Search() {
       )}
       <section class="page-body">
         {state.keyword && !state.loading && state.items.length > 0 && (
-          <div class="result-head">“{state.keyword}” 的搜索结果{state.notes.length ? <span class="result-note">（部分来源失败：{state.notes.join('；')}）</span> : null}</div>
+          <div class="result-head">“{state.keyword}” 的搜索结果{matchSummary(state.items)}{state.notes.length ? <span class="result-note">（{state.notes.join('；')}）</span> : null}</div>
         )}
         {state.items.length > 0 && (
           <PosterGrid items={state.items} group="search-grid" showSource={source === 'all'}

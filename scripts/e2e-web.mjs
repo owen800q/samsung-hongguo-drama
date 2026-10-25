@@ -322,6 +322,75 @@ try {
   check('an empty filter offers 查看全部', emptyAll);
   await hist.close();
 
+  // Search ranks title matches first and fills in seasons; 查找下一季 on a season lists later
+  // seasons of the same source as chips the remote can reach, and opens the picked one's detail.
+  const seas = await ctx.newPage();
+  await seas.addInitScript(() => { window.tizen = { tvinputdevice: { registerKey() {} } }; });
+  seas.on('pageerror', e => errors.push('season page: ' + e));
+  const seasFocused = () => seas.evaluate(() => (document.activeElement.textContent || '').trim());
+  const press = async (k, n = 1) => { for (let i = 0; i < n; i++) { await seas.keyboard.press(k); await seas.waitForTimeout(300); } };
+  await seas.goto(URL_);
+  await seas.waitForSelector('.sidebar-item', { timeout: 30000 });
+  await seas.evaluate(() => document.querySelector('[data-sidebar-tab="search"]').focus());
+  await press('Enter');
+  await seas.waitForSelector('.search-input', { timeout: 10000 });
+  await seas.evaluate(() => document.querySelector('.search-input').focus());
+  await press('Enter');
+  await seas.keyboard.type('贞观憨婿');
+  await press('Enter');
+  await seas.waitForSelector('[data-focus-group="search-grid"] .poster', { timeout: 60000 }).catch(() => {});
+  await seas.waitForFunction(() => document.querySelector('.result-head'), null, { timeout: 60000 }).catch(() => {});
+  const grid = await seas.evaluate(() => ({
+    titles: Array.from(document.querySelectorAll('[data-focus-group="search-grid"] .poster-title')).map(t => t.textContent),
+    head: (document.querySelector('.result-head') || {}).textContent || '',
+  }));
+  const isMatch = t => t.replace(/\s/g, '').indexOf('贞观憨婿') >= 0;
+  const firstOther = grid.titles.findIndex(t => !isMatch(t));
+  check('search lists title matches before other results', grid.titles.length > 0 && isMatch(grid.titles[0]) && (firstOther < 0 || grid.titles.slice(firstOther).every(t => !isMatch(t))),
+    grid.titles.slice(0, 8).join(','));
+  check('the result head counts title matches', firstOther < 0 || /部标题匹配/.test(grid.head), grid.head);
+  const seasonNo = t => { const m = /第([一二三四五六七八九十\d]+)季/.exec(t); return m ? '一二三四五六七八九'.indexOf(m[1]) + 1 || Number(m[1]) : 1; };
+  const matches = grid.titles.filter(isMatch);
+  const pick = grid.titles.indexOf(matches.slice().sort((a, b) => seasonNo(a) - seasonNo(b))[0]);
+  const highest = Math.max.apply(null, matches.map(seasonNo));
+  check('season results for a series name include several seasons', matches.length >= 2 && highest > seasonNo(grid.titles[pick]), matches.join(','));
+  await seas.waitForTimeout(400);
+  if (!/poster/.test(await seas.evaluate(() => document.activeElement.className))) await press('ArrowDown');
+  await press('ArrowDown', Math.floor(pick / 6));
+  await press('ArrowRight', pick % 6);
+  const pickedTitle = grid.titles[pick];
+  check('the remote reaches the earliest season poster', (await seasFocused()).indexOf(pickedTitle) >= 0, await seasFocused());
+  await press('Enter');
+  await seas.waitForSelector('.detail .btn-primary:not([disabled])', { timeout: 30000 });
+  await seas.waitForTimeout(800);
+  for (let i = 0; i < 4 && !/查找下一季/.test(await seasFocused()); i++) await press('ArrowRight');
+  check('查找下一季 sits in the detail action row, on screen', /查找下一季/.test(await seasFocused()) && await seas.evaluate(() => {
+    const r = document.activeElement.getBoundingClientRect();
+    return r.right <= 1920 && r.bottom <= 1080;
+  }), await seasFocused());
+  await press('Enter');
+  await seas.waitForFunction(() => document.querySelector('.detail-sequels'), null, { timeout: 60000 }).catch(() => {});
+  const found = await seas.evaluate(() => ({
+    chips: Array.from(document.querySelectorAll('[data-focus-group="detail-sequels"] .chip')).map(c => c.textContent),
+    note: ((document.querySelector('.detail-sequels') || {}).textContent || '').trim(),
+    focused: document.activeElement.tagName === 'BUTTON' ? (document.activeElement.textContent || '').trim() : document.activeElement.tagName,
+    fits: Array.from(document.querySelectorAll('.detail-sequels .chip')).every(c => c.getBoundingClientRect().right <= 1920),
+  }));
+  check('查找下一季 lists only later seasons of the same series, with focus kept on the button',
+    found.chips.length > 0 && found.chips.every(t => isMatch(t) && seasonNo(t) > seasonNo(pickedTitle)) && found.focused === '重新查找' && found.fits,
+    JSON.stringify(found).slice(0, 200));
+  await press('ArrowDown');
+  const chip = await seasFocused();
+  check('down from the actions moves onto a candidate', found.chips.indexOf(chip) >= 0, chip);
+  await press('Enter');
+  await seas.waitForFunction(t => Array.from(document.querySelectorAll('.detail-title')).some(h => h.textContent === t), chip, { timeout: 30000 }).catch(() => {});
+  const opened = await seas.evaluate(() => Array.from(document.querySelectorAll('.screen.is-active .detail-title')).map(h => h.textContent).join());
+  check('picking a candidate opens its detail, not playback', opened === chip && !(await seas.$('video.player-video')), opened);
+  await seas.keyboard.press('Escape'); await seas.waitForTimeout(800);
+  const back = await seas.evaluate(() => ({ title: Array.from(document.querySelectorAll('.screen.is-active .detail-title')).map(h => h.textContent).join(), focused: (document.activeElement.textContent || '').trim() }));
+  check('back returns to the earlier season with focus on the candidate', (back.title === pickedTitle || back.title.replace(/\s/g, '') === pickedTitle.replace(/\s/g, '')) && back.focused === chip, JSON.stringify(back));
+  await seas.close();
+
   // A protected 红果 page only exposes a ~10 s preview: playback must use the App source instead.
   const prot = await ctx.newPage();
   await prot.addInitScript(() => { window.tizen = { tvinputdevice: { registerKey() {} }, application: { getCurrentApplication: () => ({ exit() {} }) } }; });

@@ -22,6 +22,11 @@ function Screen({ entry, active, children }) {
   const ref = useRef(null);
   const saved = useRef(null);
   const ctx = useMemo(() => ({ active, id: entry.id }), [active, entry.id]);
+  // Note the focused element while rendering the covering change: once the commit hides this
+  // screen the browser blurs it, before the effect cleanup below runs.
+  const wasActive = useRef(active);
+  if (wasActive.current && !active && ref.current && ref.current.contains(document.activeElement)) saved.current = document.activeElement;
+  wasActive.current = active;
   useEffect(() => {
     if (!active) return undefined;
     // Returning to a screen restores the element that had focus when it was covered.
