@@ -415,22 +415,33 @@ try {
   await hpress('Enter');
   await hgs.waitForSelector('.search-input', { timeout: 10000 });
   await hgs.evaluate(() => document.querySelector('.search-input').focus());
-  await hpress('ArrowDown');
-  for (let i = 0; i < 4 && (await hgs.evaluate(() => document.activeElement.textContent.trim())) !== '红果'; i++) await hpress('ArrowRight');
+  // Pick 红果 in the source row with OK.
+  await hgs.evaluate(() => Array.from(document.querySelectorAll('[data-focus-group="search-source"] .chip')).find(c => c.textContent === '红果').focus());
   await hpress('Enter');
+  const picked = await hgs.evaluate(() => (document.querySelector('[data-focus-group="search-source"] .is-selected') || {}).textContent);
   await hgs.evaluate(() => document.querySelector('.search-input').focus());
   await hpress('Enter');
   await hgs.keyboard.type('谁说纨绔，不能当状元');
   await hpress('Enter');
-  await hgs.waitForFunction(() => document.querySelector('.result-head') || document.querySelector('.status-empty'), null, { timeout: 60000 }).catch(() => {});
-  await hgs.waitForTimeout(600);
-  const hg = await hgs.evaluate(() => ({
-    titles: Array.from(document.querySelectorAll('[data-focus-group="search-grid"] .poster-title')).map(t => t.textContent),
-    head: ((document.querySelector('.result-head') || document.querySelector('.status-empty') || {}).textContent || '').trim(),
-    focused: document.activeElement.className,
-  }));
+  const readResults = async () => {
+    await hgs.waitForFunction(() => document.querySelector('.result-head') || document.querySelector('.status-empty'), null, { timeout: 60000 }).catch(() => {});
+    await hgs.waitForTimeout(600);
+    return hgs.evaluate(() => ({
+      titles: Array.from(document.querySelectorAll('[data-focus-group="search-grid"] .poster-title')).map(t => t.textContent),
+      head: ((document.querySelector('.result-head') || document.querySelector('.status-empty') || {}).textContent || '').trim(),
+      focused: document.activeElement.className,
+    }));
+  };
+  let hg = await readResults();
+  // The endpoint sometimes hangs or answers 502; like a viewer, search once more with OK on 搜索.
+  if (/红果搜索(超时|服务暂不可用|失败)/.test(hg.head)) {
+    await hgs.evaluate(() => Array.from(document.querySelectorAll('.search-field .btn')).find(b => b.textContent === '搜索').focus());
+    await hpress('Enter');
+    await hgs.waitForFunction(() => !document.querySelector('.skeleton, .poster-skeleton'), null, { timeout: 60000 }).catch(() => {});
+    hg = await readResults();
+  }
   check('红果 search finds the series although the keyword has extra punctuation',
-    hg.titles[0] === '谁说纨绔不能当状元' && /poster/.test(hg.focused), hg.titles.slice(0, 4).join(',') + ' | ' + hg.head.slice(0, 80));
+    picked === '红果' && hg.titles[0] === '谁说纨绔不能当状元' && /poster/.test(hg.focused), picked + ' | ' + hg.titles.slice(0, 4).join(',') + ' | ' + hg.head.slice(0, 80));
   const firstPage = hg.titles.length;
   for (let i = 0; i < 4; i++) await hpress('ArrowDown');
   await hgs.waitForFunction(n => document.querySelectorAll('[data-focus-group="search-grid"] .poster').length > n, firstPage, { timeout: 30000 }).catch(() => {});
