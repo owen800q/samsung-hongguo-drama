@@ -125,9 +125,13 @@ try {
   const corner = await page.evaluate(() => {
     const c = document.querySelector('.player.osd-visible .player-clock'), m = document.querySelector('.player-meta');
     const r = c ? c.getBoundingClientRect() : null, t = document.querySelector('.player-title').getBoundingClientRect();
-    return { clock: c ? c.textContent : '', meta: m ? m.textContent : '', fits: !!r && r.right <= 1920 && r.top >= 0 && r.left >= t.right };
+    const v = document.querySelector('video.player-video');
+    return { clock: c ? c.textContent : '', meta: m ? m.textContent : '', w: v.videoWidth, h: v.videoHeight, fits: !!r && r.right <= 1920 && r.top >= 0 && r.left >= t.right };
   });
-  check('paused controls show the clock and the decoded picture size', /^\d\d:\d\d$/.test(corner.clock) && corner.fits && corner.meta === '当前画面 540P（540 × 960）', JSON.stringify(corner));
+  // The VP9 stand-in is 540x960; without a decodable picture the line stays hidden.
+  const wantMeta = corner.w && corner.h ? '当前画面 ' + Math.min(corner.w, corner.h) + 'P（' + corner.w + ' × ' + corner.h + '）' : '';
+  check('paused controls show the clock and the decoded picture size', /^\d\d:\d\d$/.test(corner.clock) && corner.fits && corner.meta === wantMeta && (!webMedia.length || corner.w === 540),
+    JSON.stringify(corner));
   await key(415); await page.waitForTimeout(800);
   check('play key resumes', !(await videoState()).paused);
   await key(404); await page.waitForTimeout(600);
