@@ -15,11 +15,14 @@ function parseId(value, episode) {
   return { source: parts[1], duanjuId: parts[2], episodeId: parts[3], seriesId: parts.slice(0, 3).join(':') };
 }
 
-async function call(path, params) {
+/** `deadline` (ms timestamp, optional) shortens the request to the time a search has left. */
+async function call(path, params, deadline) {
+  const left = deadline ? deadline - Date.now() : 12000;
+  if (left < 1000) throw new Error('西饭加载超时，请重试');
   let data;
   try {
     data = await getJson(withQuery(API + path, Object.assign({}, params, { version: 2001001, androidVersionCode: 28 })),
-      { timeout: 12000, headers: { Accept: 'application/json' } });
+      { timeout: Math.min(12000, left), headers: { Accept: 'application/json' } });
   } catch (error) {
     throw new Error(error && error.message === '请求超时' ? '西饭加载超时，请重试' : '西饭来源暂不可用，请稍后重试');
   }
@@ -81,12 +84,12 @@ export async function browseList(options = {}) {
   } catch (error) { return { success: false, error: error.message }; }
 }
 
-export async function search(keyword, page = 1) {
+export async function search(keyword, page = 1, options = {}) {
   try {
     const kw = String(keyword || '').trim();
     if (!kw) throw new Error('请输入搜索关键词');
     const pg = Math.max(1, parseInt(page, 10) || 1);
-    return normalizeList(await call('/xifan/search/getSearchList', { keyword: kw, pageIndex: pg }), pg, []);
+    return normalizeList(await call('/xifan/search/getSearchList', { keyword: kw, pageIndex: pg }, options.deadline), pg, []);
   } catch (error) { return { success: false, error: error.message }; }
 }
 

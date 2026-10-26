@@ -57,13 +57,44 @@ export function supplementQueries(keyword, results, known, afterSeason) {
   return seasonQueries(parsed.base, next);
 }
 
-/** 0 = exact title, 1 = title contains the keyword, 2 = another result the source returned. */
-export function relevance(title, keyword) {
-  const t = normalizeTitle(title), k = normalizeTitle(keyword);
-  return t === k ? 0 : t.indexOf(k) >= 0 ? 1 : 2;
+// Whitespace, punctuation and symbols (after NFKC, so full-width forms are already ASCII).
+// Spelled out because Chromium 56 has no \p{P} / \p{S} regex classes.
+const PUNCT = /[\s!-\/:-@\[-`{-~\u00a1-\u00bf\u00d7\u00f7\u2000-\u206f\u2100-\u2bff\u3000-\u3004\u3008-\u3020\u3030-\u303f\u30fb\ufe10-\ufe1f\ufe30-\ufe4f\uff01-\uff0f\uff1a-\uff20\uff3b-\uff40\uff5b-\uff65\uffe0-\uffee]+/g;
+
+/** Title text for matching: full-/half-width, case, spaces and punctuation do not count. */
+export function searchText(value) {
+  return String(value || '').normalize('NFKC').toLowerCase().replace(PUNCT, '');
 }
 
-/** Drop duplicates (per source) and untitled entries; stable-sort by title relevance. */
+/**
+ * Looser searches for a keyword whose results have no title match (at most two): the
+ * keyword without punctuation and spaces, then its first clause of two or more characters.
+ * "言出法随，诸天万界我说了算" → ["言出法随诸天万界我说了算", "言出法随"].
+ */
+export function relaxedQueries(keyword) {
+  const text = String(keyword || '').normalize('NFKC').trim();
+  const stripped = text.replace(PUNCT, '');
+  const out = [];
+  if (stripped && stripped !== text) out.push(stripped);
+  const first = text.split(PUNCT).filter(part => part.length >= 2)[0];
+  if (first && first !== text && out.indexOf(first) < 0) out.push(first);
+  return out.slice(0, 2);
+}
+
+/** 0 = exact title, 1 = title contains the keyword, 2 = another result the source returned. */
+export function relevance(title, keyword) {
+  const t = searchText(title), k = searchText(keyword);
+  return !k ? 2 : t === k ? 0 : t.indexOf(k) >= 0 ? 1 : 2;
+}
+
+export function hasTitleMatch(results, keyword) {
+  return results.some(r => r && relevance(r.series_title, keyword) < 2);
+}
+
+/**
+ * Drop duplicates (per source) and untitled entries; stable-sort by title relevance. Among
+ * the other results, those found by a looser search (`fuzzy`) come first.
+ */
 export function rankResults(results, keyword) {
   const seen = new Set();
   return results.filter(r => {
@@ -72,7 +103,7 @@ export function rankResults(results, keyword) {
     seen.add(key);
     return true;
   }).map((r, i) => ({ r, i, rel: relevance(r.series_title, keyword) }))
-    .sort((a, b) => a.rel - b.rel || a.i - b.i)
+    .sort((a, b) => a.rel - b.rel || (a.rel === 2 && !!a.r.fuzzy !== !!b.r.fuzzy ? (a.r.fuzzy ? -1 : 1) : 0) || a.i - b.i)
     .map(x => Object.assign({}, x.r, { relevance: x.rel }));
 }
 

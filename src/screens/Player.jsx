@@ -4,7 +4,7 @@ import { resolvePlayback, prefetch, release } from '../media/playback.js';
 import { markWebMediaFailure } from '../sources/index.js';
 import { CancelToken } from '../lib/http.js';
 import { getHistoryEntry, getSettings, recordProgress, saveSettings } from '../lib/storage.js';
-import { errorMessage, formatTime } from '../lib/format.js';
+import { errorMessage, formatClock, formatPicture, formatTime } from '../lib/format.js';
 import { setScreenSaver } from '../platform/tv.js';
 import { Icon } from '../components/Icon.jsx';
 import { focusElement, focusFirst } from '../lib/focus.js';
@@ -39,6 +39,9 @@ export function Player({ series, index: startIndex, fromStart }) {
   // Bumped to reload the current episode with a fresh address (retry / reconnect).
   const [reload, setReload] = useState(0);
   const [reconnecting, setReconnecting] = useState(false);
+  // Shown with the controls: the actual decoded size (not the source's best quality) and a clock.
+  const [picture, setPicture] = useState({ width: 0, height: 0 });
+  const [now, setNow] = useState(() => new Date());
   const osdTimer = useRef(0);
   const seekTimer = useRef(0);
   const seekRef = useRef(null);
@@ -150,8 +153,12 @@ export function Player({ series, index: startIndex, fromStart }) {
   useEffect(() => {
     const v = video.current;
     const on = (name, fn) => { v.addEventListener(name, fn); return () => v.removeEventListener(name, fn); };
+    const readSize = () => setPicture({ width: v.videoWidth || 0, height: v.videoHeight || 0 });
     const offs = [
+      on('resize', readSize),
+      on('emptied', readSize),
       on('loadedmetadata', () => {
+        readSize();
         const at = resumeFrom.current;
         if (at > 3 && v.duration && at < v.duration - 8) v.currentTime = at;
         v.playbackRate = rateRef.current;
@@ -194,6 +201,9 @@ export function Player({ series, index: startIndex, fromStart }) {
       }),
     ];
     saveTimer.current = setInterval(() => { if (!v.paused) save(); }, 5000);
+    // Minute precision; checking every 15 s keeps it at most that far behind.
+    const clock = setInterval(() => setNow(new Date()), 15000);
+    offs.push(() => clearInterval(clock));
     const onHide = () => { if (document.hidden) { v.pause(); save(); } };
     document.addEventListener('visibilitychange', onHide);
     return () => {
@@ -396,6 +406,8 @@ export function Player({ series, index: startIndex, fromStart }) {
       <div class="player-top">
         <div class="player-title">{series.series_title}</div>
         <div class="player-sub">第 {episode ? episode.vid_index : '-'} 集 / 共 {episodes.length} 集{rate !== 1 ? ' · ' + rate + '×' : ''}</div>
+        {formatPicture(picture.width, picture.height) && <div class="player-meta">{formatPicture(picture.width, picture.height)}</div>}
+        <div class="player-clock">{formatClock(now)}</div>
       </div>
 
       {upNext && nextIndex >= 0 && status === 'playing' && (

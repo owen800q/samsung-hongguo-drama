@@ -122,6 +122,12 @@ try {
   check('right key seeks forward', (await videoState()).t > before + 3, before + ' -> ' + (await videoState()).t);
   await key(19); await page.waitForTimeout(500);
   check('pause key pauses', (await videoState()).paused);
+  const corner = await page.evaluate(() => {
+    const c = document.querySelector('.player.osd-visible .player-clock'), m = document.querySelector('.player-meta');
+    const r = c ? c.getBoundingClientRect() : null, t = document.querySelector('.player-title').getBoundingClientRect();
+    return { clock: c ? c.textContent : '', meta: m ? m.textContent : '', fits: !!r && r.right <= 1920 && r.top >= 0 && r.left >= t.right };
+  });
+  check('paused controls show the clock and the decoded picture size', /^\d\d:\d\d$/.test(corner.clock) && corner.fits && corner.meta === '当前画面 540P（540 × 960）', JSON.stringify(corner));
   await key(415); await page.waitForTimeout(800);
   check('play key resumes', !(await videoState()).paused);
   await key(404); await page.waitForTimeout(600);
@@ -390,6 +396,43 @@ try {
   const back = await seas.evaluate(() => ({ title: Array.from(document.querySelectorAll('.screen.is-active .detail-title')).map(h => h.textContent).join(), focused: (document.activeElement.textContent || '').trim() }));
   check('back returns to the earlier season with focus on the candidate', (back.title === pickedTitle || back.title.replace(/\s/g, '') === pickedTitle.replace(/\s/g, '')) && back.focused === chip, JSON.stringify(back));
   await seas.close();
+
+  // 红果 search goes through the website's search endpoint: a title written with different
+  // punctuation still matches, and scrolling down loads its next page (10 results each).
+  const hgs = await ctx.newPage();
+  await hgs.addInitScript(() => { window.tizen = { tvinputdevice: { registerKey() {} } }; });
+  hgs.on('pageerror', e => errors.push('hongguo search page: ' + e));
+  const apiPages = [];
+  hgs.on('request', r => { const m = /\/api\/search\/result\?.*page=(\d+)/.exec(r.url()); if (m) apiPages.push(Number(m[1])); });
+  const hpress = async (k, n = 1) => { for (let i = 0; i < n; i++) { await hgs.keyboard.press(k); await hgs.waitForTimeout(300); } };
+  await hgs.goto(URL_);
+  await hgs.waitForSelector('.sidebar-item', { timeout: 30000 });
+  await hgs.evaluate(() => document.querySelector('[data-sidebar-tab="search"]').focus());
+  await hpress('Enter');
+  await hgs.waitForSelector('.search-input', { timeout: 10000 });
+  await hgs.evaluate(() => document.querySelector('.search-input').focus());
+  await hpress('ArrowDown');
+  for (let i = 0; i < 4 && (await hgs.evaluate(() => document.activeElement.textContent.trim())) !== '红果'; i++) await hpress('ArrowRight');
+  await hpress('Enter');
+  await hgs.evaluate(() => document.querySelector('.search-input').focus());
+  await hpress('Enter');
+  await hgs.keyboard.type('谁说纨绔，不能当状元');
+  await hpress('Enter');
+  await hgs.waitForFunction(() => document.querySelector('.result-head') || document.querySelector('.status-empty'), null, { timeout: 60000 }).catch(() => {});
+  await hgs.waitForTimeout(600);
+  const hg = await hgs.evaluate(() => ({
+    titles: Array.from(document.querySelectorAll('[data-focus-group="search-grid"] .poster-title')).map(t => t.textContent),
+    head: ((document.querySelector('.result-head') || document.querySelector('.status-empty') || {}).textContent || '').trim(),
+    focused: document.activeElement.className,
+  }));
+  check('红果 search finds the series although the keyword has extra punctuation',
+    hg.titles[0] === '谁说纨绔不能当状元' && /poster/.test(hg.focused), hg.titles.slice(0, 4).join(',') + ' | ' + hg.head.slice(0, 80));
+  const firstPage = hg.titles.length;
+  for (let i = 0; i < 4; i++) await hpress('ArrowDown');
+  await hgs.waitForFunction(n => document.querySelectorAll('[data-focus-group="search-grid"] .poster').length > n, firstPage, { timeout: 30000 }).catch(() => {});
+  const grown = await hgs.evaluate(() => document.querySelectorAll('[data-focus-group="search-grid"] .poster').length);
+  check('scrolling down loads the next 红果 search page', grown > firstPage && apiPages.indexOf(2) >= 0, firstPage + ' -> ' + grown + ' pages ' + apiPages.join(','));
+  await hgs.close();
 
   // A protected 红果 page only exposes a ~10 s preview: playback must use the App source instead.
   const prot = await ctx.newPage();

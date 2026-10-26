@@ -1,7 +1,7 @@
 // 红果 via the official website (hongguoduanju.com). Player pages are server-rendered
 // and embed the full episode vid list plus clear MP4 links for the web-accessible range.
-import { getText, request, memo } from '../lib/http.js';
-import { readRouterData, uniqueBy } from './util.js';
+import { getJson, getText, request, memo, withQuery } from '../lib/http.js';
+import { decodeHtml, httpsUrl, readRouterData, uniqueBy } from './util.js';
 import { fetchAppPlayUrl } from './app-source.js';
 
 const SITE = 'https://hongguoduanju.com';
@@ -17,41 +17,34 @@ function normalizeVideoUrl(raw) {
     .replace(/[?&]$/, '');
 }
 
-function unescapeJson(value) {
-  try { return JSON.parse('"' + value + '"'); } catch (_) { return value.replace(/\\u002F/g, '/').replace(/\\u0026/g, '&'); }
-}
-
-function pickJsonString(text, key) {
-  const m = text.match(new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"'));
-  return m ? unescapeJson(m[1]) : '';
-}
-
 function fetchSiteHtml(url) {
   return getText(url, { timeout: 20000, headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' } });
 }
 
 async function fetchEpisodeListFromWeb(seriesId) {
   const html = await fetchSiteHtml(SITE + '/player/' + encodeURIComponent(seriesId));
-  const m = html.match(/"vid_list"\s*:\s*\[([^\]]*)\]/);
-  if (!m) throw new Error('红果官网未返回分集数据，请稍后重试');
-  const vids = m[1].split(',').map(s => s.trim().replace(/^"|"$/g, '')).filter(s => /^\d+$/.test(s));
+  const loader = readRouterData(html).loaderData || {};
+  const data = loader['player_(series_id)/page'] || loader['player_(series_id)/(vid)/page'];
+  const detail = data && data.seriesDetail;
+  // Identity and episodes come from the current player's own object, never from recommendations.
+  if (!data || data.isSuccess === false || !detail || String(detail.series_id) !== String(seriesId) ||
+      (data.series_id != null && String(data.series_id) !== String(seriesId))) {
+    throw new Error('红果官网返回的剧集与请求不一致，请稍后重试');
+  }
+  if (!Array.isArray(detail.vid_list)) throw new Error('红果官网未返回分集数据，请稍后重试');
+  const vids = detail.vid_list.map(String);
+  if (vids.some(v => !/^\d{1,30}$/.test(v)) || new Set(vids).size !== vids.length) throw new Error('红果分集数据异常，请稍后重试');
   if (!vids.length) throw new Error('红果分集列表为空');
-  const title = pickJsonString(html, 'series_name') || '未命名短剧';
-  const cover = pickJsonString(html, 'series_cover');
-  const intro = pickJsonString(html, 'series_intro');
-  const tagsMatch = html.match(/"tags"\s*:\s*(\[[^\]]*\])/);
-  let tags = [];
-  try { tags = tagsMatch ? JSON.parse(tagsMatch[1]).filter(t => typeof t === 'string').slice(0, 6) : []; } catch (_) {}
-  const accessible = html.match(/"accessible_episode_cnt"\s*:\s*(\d+)/);
-  const webAccessible = accessible ? Math.min(Number(accessible[1]), vids.length) : null;
+  const text = value => typeof value === 'string' ? value : '';
+  const accessible = /^\d+$/.test(String(detail.accessible_episode_cnt)) ? Math.min(Number(detail.accessible_episode_cnt), vids.length) : null;
   return {
     series_id: String(seriesId),
-    series_title: title,
-    cover,
-    intro,
-    tags,
+    series_title: text(detail.series_name) || text(detail.series_title) || '未命名短剧',
+    cover: text(detail.series_cover),
+    intro: text(detail.series_intro),
+    tags: Array.isArray(detail.tags) ? detail.tags.filter(t => typeof t === 'string').slice(0, 6) : [],
     total: vids.length,
-    web_accessible_episodes: webAccessible,
+    web_accessible_episodes: accessible,
     // Episodes past the web range are still attempted through the App source.
     episodes: vids.map((vid, i) => ({ vid, vid_index: i + 1, title: '', locked: false })),
     source: 'hongguo',
@@ -207,29 +200,98 @@ export async function resolveSeriesId(input) {
   throw new Error('无法从链接解析剧集 ID');
 }
 
-export async function search(keyword) {
-  try {
-    const kw = String(keyword || '').trim();
-    if (!kw) throw new Error('请输入搜索关键词');
-    const html = await fetchSiteHtml(SITE + '/search/' + encodeURIComponent(kw));
-    const loader = readRouterData(html).loaderData || {};
-    let data = null;
-    Object.keys(loader).forEach(k => { if (/^search_/.test(k) && loader[k] && Array.isArray(loader[k].searchList)) data = loader[k]; });
-    if (!data) throw new Error('红果搜索数据异常，请稍后重试');
-    const results = uniqueBy(data.searchList.map(item => item && item.video_data).filter(v =>
-      v && /^\d{6,}$/.test(String(v.series_id)) && typeof v.series_title === 'string' && v.series_title.trim()),
-    v => String(v.series_id)).map(v => ({
-      series_id: String(v.series_id),
-      series_title: v.series_title.trim(),
-      cover: typeof v.series_cover === 'string' ? v.series_cover : '',
-      episode_count: Number(v.episode_cnt) || 0,
-      tags: Array.isArray(v.category_list) ? v.category_list.map(c => c && c.name).filter(t => typeof t === 'string').slice(0, 4) : [],
-      intro: typeof v.series_intro === 'string' ? v.series_intro : '',
+// The search page is an empty shell; its script fetches this endpoint, which needs no
+// signature, cookie or Referer. It pages 10 results at a time and sometimes hangs or
+// answers 502, so each page gets one retry and successful pages are kept for a minute.
+const SEARCH_API = SITE + '/api/search/result';
+const searchCache = memo(60000, 30);
+export const SEARCH_MAX_PAGE = 50;
+
+function searchError(message, retry) {
+  const error = new Error(message);
+  error.retry = retry;
+  return error;
+}
+
+function searchCount(video) {
+  const n = Number(video && video.episode_cnt);
+  if (Number.isInteger(n) && n > 0) return n;
+  const m = String((video && video.episode_right_text) || '').match(/(\d+)\s*集/);
+  return m ? Number(m[1]) : 0;
+}
+
+/** The endpoint's JSON → { results, total, totalPages, page, hasMore }; throws on an unusable answer. */
+export function parseSearchResponse(payload) {
+  if (payload == null || payload === '' || typeof payload === 'string') throw searchError('红果搜索服务暂不可用，请稍后重试', true);
+  if (typeof payload !== 'object' || Array.isArray(payload) || !Array.isArray(payload.searchList)) {
+    if (payload && typeof payload.code === 'string') throw searchError('红果搜索服务暂不可用（' + (payload.message || payload.code) + '）', true);
+    throw searchError('红果搜索返回异常数据，接口可能已变化', false);
+  }
+  const results = uniqueBy(payload.searchList.map(item => {
+    const data = item && item.video_data;
+    const v = data && typeof data === 'object' && Object.keys(data).length ? data : (item || {});
+    // Some entries leave video_data empty and carry the series id in `keyword`.
+    const id = String(v.series_id || (item && item.series_id) || (item && item.keyword) || '').trim();
+    const title = decodeHtml(String(v.series_title || v.series_name || (item && item.name) || '')).trim();
+    const tags = Array.isArray(v.category_list) ? v.category_list : Array.isArray(v.tags) ? v.tags : [];
+    return {
+      series_id: id,
+      series_title: title,
+      cover: httpsUrl(normalizeVideoUrl(v.series_cover || v.cover || '')),
+      episode_count: searchCount(v),
+      tags: tags.map(t => typeof t === 'string' ? t : t && t.name).filter(t => typeof t === 'string' && t).slice(0, 4),
+      intro: typeof v.series_intro === 'string' ? decodeHtml(v.series_intro) : '',
       heat: v.hot_score_data && typeof v.hot_score_data.text === 'string' ? v.hot_score_data.text : '',
       source: 'hongguo',
-    }));
-    // The website renders only the first page of results server-side.
-    return { success: true, results, page: 1, totalPages: 1, hasMore: false, nextPage: null };
+    };
+  }).filter(r => /^\d{6,30}$/.test(r.series_id) && r.series_title), r => r.series_id);
+  // Entries were returned but none could be read: the format changed, which is not "no results".
+  if (!results.length && payload.searchList.length) throw searchError('红果搜索结果无法识别，接口可能已变化', false);
+  const num = (value, min) => { const n = Number(value); return Number.isFinite(n) && n >= min ? n : null; };
+  return {
+    results,
+    total: num(payload.totalCount, 0) == null ? results.length : num(payload.totalCount, 0),
+    totalPages: num(payload.totalPages, 0) || 0,
+    page: num(payload.pageNum, 1) || 1,
+    hasMore: payload.hasMore === true,
+  };
+}
+
+async function fetchSearchPage(kw, page, deadline) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const left = deadline ? deadline - Date.now() : Infinity;
+    if (left < 1000) { lastError = lastError || searchError('红果搜索超时，请稍后重试', false); break; }
+    try {
+      const data = await getJson(withQuery(SEARCH_API, { aid: 8662, query: kw, page }),
+        { timeout: Math.min(10000, left), headers: { Accept: 'application/json, text/plain, */*' } });
+      return parseSearchResponse(data);
+    } catch (error) {
+      const status = error && error.status;
+      lastError = error && error.retry !== undefined ? error
+        : error && error.message === '请求超时' ? searchError('红果搜索超时，请稍后重试', true)
+        : status === 429 ? searchError('红果搜索请求过于频繁，请稍后重试', true)
+        : status >= 500 ? searchError('红果搜索服务暂不可用（HTTP ' + status + '）', true)
+        : status >= 400 ? searchError('红果搜索接口已变化（HTTP ' + status + '）', false)
+        : searchError('红果搜索失败，请检查网络后重试', true);
+      if (!lastError.retry) break;
+      if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 400));
+    }
+  }
+  throw lastError;
+}
+
+/** `options.deadline` (ms timestamp) bounds the whole search, retries included. */
+export async function search(keyword, page = 1, options = {}) {
+  try {
+    const kw = String(keyword || '').normalize('NFKC').trim();
+    if (!kw) throw new Error('请输入搜索关键词');
+    if (kw.length > 200) throw new Error('搜索关键词最多 200 字');
+    const pg = parseInt(page, 10) || 1;
+    if (pg < 1 || pg > SEARCH_MAX_PAGE) throw new Error('红果搜索最多翻到第 ' + SEARCH_MAX_PAGE + ' 页');
+    const res = await searchCache('search:' + pg + ':' + kw, () => fetchSearchPage(kw, pg, options.deadline || 0));
+    const hasMore = res.hasMore && res.results.length > 0 && pg < SEARCH_MAX_PAGE;
+    return { success: true, results: res.results, page: pg, total: res.total, totalPages: res.totalPages, hasMore, nextPage: hasMore ? pg + 1 : null };
   } catch (error) {
     return { success: false, error: /红果|关键词/.test(error.message) ? error.message : '红果搜索失败，请检查网络后重试' };
   }

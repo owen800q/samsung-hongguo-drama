@@ -4,7 +4,7 @@ import * as catalog from './catalog.js';
 import * as hongguo from './hongguo.js';
 import * as xifan from './xifan.js';
 import * as hema from './hema.js';
-import { findSequels, rankResults, seasonTitle, supplementQueries } from './seasons.js';
+import { findSequels, hasTitleMatch, rankResults, relaxedQueries, seasonTitle, supplementQueries } from './seasons.js';
 
 export const SOURCES = [
   { id: 'hongguo', label: '红果' },
@@ -75,41 +75,67 @@ function interleave(lists) {
   return out;
 }
 
-async function searchSources(kw, ids, page) {
+async function searchSources(kw, ids, page, deadline) {
   const settled = await Promise.all(ids.map(id =>
-    ADAPTERS[id].search(kw, page).catch(error => ({ success: false, error: error.message }))
+    ADAPTERS[id].search(kw, page, { deadline }).catch(error => ({ success: false, error: error.message }))
       .then(res => ({ id, res }))));
   const ok = settled.filter(x => x.res.success);
   return {
     ok: ok.map(x => x.id),
     results: interleave(ok.map(x => (x.res.results || []).map(r => Object.assign({ source: x.id }, r)))),
-    hasMore: ok.some(x => x.res.hasMore),
+    more: ok.filter(x => x.res.hasMore && (x.res.results || []).length > 0).map(x => x.id),
     errors: settled.filter(x => !x.res.success).map(x => ({ source: x.id, error: x.res.error || '搜索失败' })),
   };
 }
 
+// One search, supplements included, gets 20 s; whatever answered by then is shown.
+const SEARCH_BUDGET = 20000;
+const MAX_PAGE = 50;
+
 /**
- * Searches the chosen sources. On the first page a series name that matches a season title
- * ("剧名第二季") also searches for the lowest missing later season (at most two extra
- * searches, see seasons.js); results are deduplicated and ranked by title match.
- * `options.afterSeason` starts that season search after a known season.
+ * Searches the chosen sources. On the first page, a keyword with no title match is searched
+ * again without punctuation and spaces, then by its first clause (at most two looser
+ * searches, stopping at the first title match; see relaxedQueries). A series name that
+ * matches a season title ("剧名第二季") also searches for the lowest missing later season
+ * (at most two extra searches, see seasons.js). Results are deduplicated and ranked by
+ * title match. Later pages page the original keyword, only on `options.only` (the sources
+ * that reported more), up to page 50. `options.afterSeason` starts the season search after
+ * a known season.
  */
 export async function search(keyword, options = {}) {
   const kw = String(keyword || '').trim();
   if (!kw) return { success: false, results: [], hasMore: false, nextPage: null, errors: [], error: '请输入搜索关键词' };
   const page = Math.max(1, parseInt(options.page, 10) || 1);
+  const deadline = options.deadline || Date.now() + SEARCH_BUDGET;
   const wanted = !options.source || options.source === 'all' ? SOURCES.map(s => s.id) : [options.source];
-  // Hongguo's website only renders the first page of search results.
-  const ids = page > 1 ? wanted.filter(id => id !== 'hongguo') : wanted;
-  const primary = await searchSources(kw, ids, page);
+  const ids = page > 1 && Array.isArray(options.only) ? wanted.filter(id => options.only.indexOf(id) >= 0) : wanted;
+  if (page > MAX_PAGE || !ids.length) return { success: true, results: [], page, hasMore: false, nextPage: null, more: [], errors: [], partial: false, supplementErrors: [], relaxed: [] };
+  const primary = await searchSources(kw, ids, page, deadline);
   let results = primary.results;
   const supplementErrors = [];
-  if (page === 1 && primary.ok.length) {
-    // Only the sources that answered; one that already failed is reported once, in `errors`.
-    for (const query of supplementQueries(kw, results, options.known, options.afterSeason)) {
-      const extra = await searchSources(query, primary.ok, 1);
-      results = results.concat(extra.results);
+  const relaxed = [];
+  // Only the sources that answered; one that already failed is reported once, in `errors`.
+  const supplement = (query, mark) => {
+    if (Date.now() >= deadline - 1000) {
+      supplementErrors.push({ source: '', error: '搜索时间已用完' });
+      return Promise.resolve(false);
+    }
+    return searchSources(query, primary.ok, 1, deadline).then(extra => {
+      results = results.concat(mark ? extra.results.map(r => Object.assign({}, r, { fuzzy: true, fuzzy_query: query })) : extra.results);
       extra.errors.forEach(e => supplementErrors.push(e));
+      return true;
+    });
+  };
+  if (page === 1 && primary.ok.length && !/^\d{6,30}$/.test(kw) && !hasTitleMatch(results, kw)) {
+    for (const query of relaxedQueries(kw)) {
+      if (!(await supplement(query, true))) break;
+      relaxed.push(query);
+      if (hasTitleMatch(results, kw)) break;
+    }
+  }
+  if (page === 1 && primary.ok.length) {
+    for (const query of supplementQueries(kw, results, options.known, options.afterSeason)) {
+      if (!(await supplement(query, false))) break;
     }
   }
   results = rankResults(results, kw);
@@ -122,9 +148,11 @@ export async function search(keyword, options = {}) {
   }
   const success = primary.ok.length > 0 || results.length > 0;
   const errors = primary.errors;
+  // A source whose later page failed keeps its place, so the next load retries that page.
+  const more = page >= MAX_PAGE ? [] : page > 1 ? primary.more.concat(errors.map(e => e.source)) : primary.more;
   return {
-    success, results, page, hasMore: primary.hasMore, nextPage: primary.hasMore ? page + 1 : null, errors,
-    partial: supplementErrors.length > 0, supplementErrors,
+    success, results, page, hasMore: more.length > 0, nextPage: more.length ? page + 1 : null, more, errors,
+    partial: supplementErrors.length > 0, supplementErrors, relaxed,
     error: success ? undefined : (errors[0] && errors[0].error) || '搜索失败，请重试',
   };
 }
@@ -139,7 +167,7 @@ export async function findNextSeasons(series, local = []) {
   if (!parsed.base || parsed.invalid || parsed.season > 99) return { success: false, results: [], error: '剧名或季数无法识别，请按完整剧名搜索。' };
   const known = findSequels(series, local, sourceOf);
   try {
-    const res = await search(parsed.base, { source: sourceOf(series.series_id), afterSeason: parsed.season, known: [series].concat(known) });
+    const res = await search(parsed.base, { source: sourceOf(series.series_id), afterSeason: parsed.season, known: [series].concat(known), deadline: Date.now() + 22000 });
     if (!res.success) throw new Error(res.error || '来源搜索失败');
     const results = findSequels(series, known.concat(res.results), sourceOf);
     return res.partial ? { success: true, results, partial: true, error: '补充搜索未完成，可稍后重试。' } : { success: true, results };
