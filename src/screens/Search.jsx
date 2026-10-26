@@ -11,12 +11,15 @@ import { focusElement, focusFirst } from '../lib/focus.js';
 
 const SOURCE_ITEMS = [{ value: 'all', label: '全部来源' }].concat(SOURCES.map(s => ({ value: s.id, label: s.label })));
 
-// Sources also return loosely related series; those are ranked after the title matches.
+// Sources also return loosely related series; those are ranked after the title matches,
+// results of a looser search (without punctuation, or the first clause) first.
 function matchSummary(items) {
   const other = items.filter(x => x.relevance === 2).length;
   if (!other) return '';
   const matched = items.length - other;
-  return matched ? '：' + matched + ' 部标题匹配，另有 ' + other + ' 部其他结果排在后面' : '：没有标题匹配的剧，以下是来源返回的其他结果';
+  const fuzzy = items.filter(x => x.relevance === 2 && x.fuzzy).length;
+  const rest = (fuzzy ? fuzzy + ' 部补搜结果' : '') + (fuzzy && other > fuzzy ? '、' : '') + (other > fuzzy ? (other - fuzzy) + ' 部其他结果' : '');
+  return matched ? '：' + matched + ' 部标题匹配，另有 ' + rest + '排在后面' : '：没有标题匹配的剧，以下是' + rest;
 }
 
 export function Search() {
@@ -26,10 +29,10 @@ export function Search() {
   const [text, setText] = useState('');
   const [source, setSource] = useState('all');
   const [recent, setRecent] = useState(getSearches);
-  const [state, setState] = useState({ keyword: '', items: [], page: 0, hasMore: false, loading: false, error: '', notes: [] });
+  const [state, setState] = useState({ keyword: '', items: [], page: 0, hasMore: false, more: [], loading: false, error: '', notes: [] });
   const request = useRef(0);
 
-  function run(keyword, page) {
+  function run(keyword, page, only) {
     const kw = String(keyword || '').trim();
     if (!kw) return;
     const id = ++request.current;
@@ -37,17 +40,20 @@ export function Search() {
       addSearch(kw);
       setRecent(getSearches());
     }
-    setState(s => Object.assign({}, s, { keyword: kw, loading: true, error: '' }, page === 1 ? { items: [], page: 0, hasMore: false, notes: [] } : null));
-    search(kw, { source, page }).then(res => {
+    setState(s => Object.assign({}, s, { keyword: kw, loading: true, error: '' }, page === 1 ? { items: [], page: 0, hasMore: false, more: [], notes: [] } : null));
+    search(kw, { source, page, only }).then(res => {
       if (id !== request.current) return;
       const failed = (res && res.errors || []).map(e => (SOURCE_LABEL[e.source] || e.source) + '：' + e.error);
       const notes = failed.length ? ['部分来源失败：' + failed.join('；')] : [];
-      if (res && res.partial) notes.push('补充搜索后续季未完成，已显示本次查到的结果');
+      if (res && res.relaxed && res.relaxed.length) notes.push('原词没有标题匹配，已补搜“' + res.relaxed.join('”“') + '”');
+      if (res && res.partial) notes.push('补充搜索未完成，已显示本次查到的结果');
       if (!res || (!res.success && !(res.results || []).length)) throw new Error((res && res.error) || failed.join('；') || '搜索失败');
       setState(s => {
         const seen = new Set(page === 1 ? [] : s.items.map(x => x.series_id));
         const fresh = (res.results || []).filter(x => !seen.has(x.series_id));
-        return { keyword: kw, items: page === 1 ? fresh : s.items.concat(fresh), page, hasMore: !!res.hasMore && fresh.length > 0, loading: false, error: '', notes };
+        // A later page keeps the first page's notes: they describe the search, not the page.
+        return { keyword: kw, items: page === 1 ? fresh : s.items.concat(fresh), page, hasMore: !!res.hasMore && fresh.length > 0,
+          more: res.more || [], loading: false, error: '', notes: page === 1 ? notes : s.notes.concat(notes.filter(n => s.notes.indexOf(n) < 0)) };
       });
       if (page === 1 && (res.results || []).length) setTimeout(() => focusFirst('.screen.is-active .poster'), 50);
     }).catch(error => {
@@ -128,12 +134,13 @@ export function Search() {
         )}
         {state.items.length > 0 && (
           <PosterGrid items={state.items} group="search-grid" showSource={source === 'all'}
-            onNearEnd={() => { if (state.hasMore && !state.loading) run(state.keyword, state.page + 1); }}
+            onNearEnd={() => { if (state.hasMore && !state.loading) run(state.keyword, state.page + 1, state.more); }}
             onSelect={item => router.push('detail', { series: item })} />
         )}
         {state.loading && state.items.length === 0 && <PosterSkeleton count={6} />}
         {state.loading && state.items.length > 0 && <Spinner label="加载更多…" />}
-        {!state.loading && state.error && <Empty title="搜索没有成功" message={state.error} onAction={() => run(state.keyword, 1)} />}
+        {!state.loading && state.error && <Empty title="搜索没有成功" message={state.error}
+          onAction={() => state.items.length ? run(state.keyword, state.page + 1, state.more) : run(state.keyword, 1)} />}
         {!state.loading && !state.error && state.keyword && state.items.length === 0 && (
           <Empty title={'没有找到“' + state.keyword + '”'} message="换个关键词，或切换到其他来源试试。" />
         )}

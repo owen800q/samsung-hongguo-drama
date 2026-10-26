@@ -14,14 +14,17 @@ function parseId(value, episode) {
   return { bookId: parts[1], chapterId: parts[2], seriesId: parts.slice(0, 2).join(':') };
 }
 
-async function call(path, body) {
+/** `deadline` (ms timestamp, optional) shortens the request to the time a search has left. */
+async function call(path, body, deadline) {
+  const left = deadline ? deadline - Date.now() : 12000;
+  if (left < 1000) throw new Error('河马加载超时，请重试');
   try {
     const res = await request(ORIGIN + path, {
       method: body ? 'POST' : 'GET',
       headers: body ? { Accept: 'application/json', 'Content-Type': 'application/json', pname: 'www.kuaikaw.cn' } : { Accept: 'text/html' },
       body: body ? JSON.stringify(body) : null,
       responseType: body ? 'json' : 'text',
-      timeout: 12000,
+      timeout: Math.min(12000, left),
     });
     return res.data;
   } catch (error) {
@@ -84,12 +87,12 @@ export async function browseList(options = {}) {
   } catch (error) { return { success: false, error: error.message }; }
 }
 
-export async function search(keyword, page = 1) {
+export async function search(keyword, page = 1, options = {}) {
   try {
     const kw = String(keyword || '').trim();
     if (!kw) throw new Error('请输入搜索关键词');
     const pg = Math.max(1, parseInt(page, 10) || 1);
-    const res = await call('/seo/video/6007', { sourceType: 1, keyword: kw, index: pg });
+    const res = await call('/seo/video/6007', { sourceType: 1, keyword: kw, index: pg }, options.deadline);
     if (!res || res.retCode !== 0 || !res.data || !Array.isArray(res.data.bookList)) throw new Error('河马搜索数据异常，请稍后重试');
     const results = normalizeBooks(res.data.bookList);
     const hasMore = res.data.isMore === 1 && results.length > 0;

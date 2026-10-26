@@ -36,6 +36,16 @@ test('hongguo catalog + ranking', async () => {
 test('hongguo search', async () => {
   const r = await retry(async () => okList(await search('总裁', { source: 'hongguo' })));
   assert.ok(r.results.every(x => /^\d+$/.test(x.series_id) && x.source === 'hongguo'));
+  // The search endpoint pages; a later page brings new series.
+  assert.ok(r.hasMore && r.more.indexOf('hongguo') >= 0, 'a broad keyword has a second page');
+  const next = await retry(async () => okList(await search('总裁', { source: 'hongguo', page: 2, only: r.more })));
+  assert.ok(next.results.some(x => !r.results.some(y => y.series_id === x.series_id)));
+});
+
+test('hongguo search matches a title written with other punctuation', async () => {
+  const r = await retry(async () => okList(await search('谁说纨绔，不能当状元', { source: 'hongguo' })));
+  assert.equal(r.results[0].relevance, 0, r.results.slice(0, 3).map(x => x.series_title).join());
+  assert.ok(r.results.some(x => /第[二2]季$/.test(x.series_title)), 'its seasons are listed too');
 });
 
 test('hongguo series + web and app play info', async () => {
