@@ -479,6 +479,31 @@ try {
   }
   check('a protected preview page falls back to the App source', protPages > 0 && /^blob:/.test(protSrc) && protMedia.length === 0, protSrc + ' protected pages: ' + protPages + ', web hits: ' + protMedia.length);
   await prot.close();
+
+  // A hung CDN edge for the series' player page: the episode list comes from its detail page.
+  const hung = await ctx.newPage();
+  await hung.addInitScript(() => { window.tizen = { tvinputdevice: { registerKey() {} } }; });
+  hung.on('pageerror', e => errors.push('hung player page: ' + e));
+  const held = [];
+  let detailPages = 0;
+  await hung.route(/hongguoduanju\.com\/player\/\d+$/, route => { held.push(route); });
+  hung.on('request', r => { if (/hongguoduanju\.com\/detail\?series_id=\d+/.test(r.url())) detailPages++; });
+  await hung.goto(URL_);
+  await hung.waitForSelector('.poster.focusable', { timeout: 30000 });
+  await hung.evaluate(() => document.querySelector('.poster.focusable').focus());
+  const hungOpened = Date.now();
+  await hung.keyboard.press('Enter');
+  await hung.waitForSelector('.detail .btn-primary:not([disabled])', { timeout: 30000 }).catch(() => {});
+  await hung.waitForTimeout(600);
+  const hungState = await hung.evaluate(() => ({
+    episodes: document.querySelectorAll('.screen.is-active .episode').length,
+    focused: (document.activeElement.textContent || '').trim(),
+  }));
+  check('a hung 红果 player page still opens the series from its detail page, play button focused',
+    held.length > 0 && detailPages > 0 && hungState.episodes > 0 && /播放/.test(hungState.focused),
+    JSON.stringify(Object.assign({ held: held.length, detailPages, ms: Date.now() - hungOpened }, hungState)));
+  await Promise.all(held.map(route => route.abort().catch(() => {})));
+  await hung.close();
 } catch (e) {
   check('e2e run completed', false, String(e && e.stack || e));
   await page.screenshot({ path: path.join(os.tmpdir(), 'hgtv-e2e-failure.png') }).catch(() => {});
