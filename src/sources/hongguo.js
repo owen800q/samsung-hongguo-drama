@@ -1,6 +1,6 @@
 // 红果 via the official website (hongguoduanju.com). Player pages are server-rendered
 // and embed the full episode vid list plus clear MP4 links for the web-accessible range.
-import { getJson, getText, request, memo, withQuery } from '../lib/http.js';
+import { CancelToken, getJson, getText, request, memo, withQuery } from '../lib/http.js';
 import { decodeHtml, httpsUrl, readRouterData, uniqueBy } from './util.js';
 import { fetchAppPlayUrl } from './app-source.js';
 
@@ -17,14 +17,14 @@ function normalizeVideoUrl(raw) {
     .replace(/[?&]$/, '');
 }
 
-function fetchSiteHtml(url) {
-  return getText(url, { timeout: 20000, headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' } });
+function fetchSiteHtml(url, options = {}) {
+  return getText(url, Object.assign({ timeout: 20000 }, options, { headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' } }));
 }
 
-async function fetchEpisodeListFromWeb(seriesId) {
-  const html = await fetchSiteHtml(SITE + '/player/' + encodeURIComponent(seriesId));
+/** The series in a player or detail page → episode list; throws when the page is not this series. */
+export function parseEpisodeListHtml(html, seriesId) {
   const loader = readRouterData(html).loaderData || {};
-  const data = loader['player_(series_id)/page'] || loader['player_(series_id)/(vid)/page'];
+  const data = loader['player_(series_id)/page'] || loader['player_(series_id)/(vid)/page'] || loader.detail_page;
   const detail = data && data.seriesDetail;
   // Identity and episodes come from the current player's own object, never from recommendations.
   if (!data || data.isSuccess === false || !detail || String(detail.series_id) !== String(seriesId) ||
@@ -51,8 +51,79 @@ async function fetchEpisodeListFromWeb(seriesId) {
   };
 }
 
+// Some player pages come from a CDN edge that hangs or resets the connection while the
+// detail page of the same series is fine (upstream 3.6). Each round asks both pages and
+// keeps the first valid list; a round that has not answered after EPISODE_HEDGE_MS, or
+// that fails, starts another on fresh connections. TV networks are slower than upstream's
+// desktop, so the rounds keep the old 20 s limit instead of 1.5 s / 3.5 s cut-offs.
+export const EPISODE_HEDGE_MS = 3000;
+const EPISODE_ROUNDS = 3;
+const EPISODE_BUDGET = 20000;
+
+// Upstream 3.6 no longer shows raw "aborted"; a TV shows a sentence instead of "请求超时".
+function episodeLoadError(errors) {
+  const say = error => {
+    const message = (error && error.message) || '';
+    if (/^HTTP \d+$/.test(message)) return '红果官网暂不可用（' + message + '）';
+    return /红果/.test(message) ? message : '红果分集加载超时或连接中断';
+  };
+  const first = say(errors[0]);
+  const last = say(errors[errors.length - 1]);
+  return new Error(first === last ? first + '，请重试' : first + '；重试失败：' + last);
+}
+
+function fetchEpisodeRound(seriesId, timeout, cancel) {
+  const id = encodeURIComponent(seriesId);
+  return new Promise((resolve, reject) => {
+    let failed = 0;
+    let firstError = null;
+    [SITE + '/player/' + id, SITE + '/detail?series_id=' + id].forEach(url => {
+      fetchSiteHtml(url, { timeout, cancel }).then(html => parseEpisodeListHtml(html, seriesId)).then(resolve, error => {
+        firstError = firstError || error;
+        if (++failed === 2) reject(firstError);
+      });
+    });
+  });
+}
+
+function fetchEpisodeListFromWeb(seriesId, { hedgeMs = EPISODE_HEDGE_MS, budget = EPISODE_BUDGET } = {}) {
+  const deadline = Date.now() + budget;
+  return new Promise((resolve, reject) => {
+    const tokens = [];
+    const errors = [];
+    let running = 0;
+    let done = false;
+    let timer = null;
+    const finish = (fn, value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      tokens.forEach(token => token.cancel());
+      fn(value);
+    };
+    const launch = () => {
+      clearTimeout(timer);
+      const left = deadline - Date.now();
+      if (done || tokens.length >= EPISODE_ROUNDS || left < 1000) {
+        if (!running) finish(reject, episodeLoadError(errors));
+        return;
+      }
+      const token = new CancelToken();
+      tokens.push(token);
+      running++;
+      fetchEpisodeRound(seriesId, left, token).then(value => finish(resolve, value), error => {
+        running--;
+        errors.push(error);
+        if (!done) launch();
+      });
+      timer = setTimeout(launch, hedgeMs);
+    };
+    launch();
+  });
+}
+
 export function fetchEpisodeList(seriesId, options = {}) {
-  return episodesCache('episodes:' + seriesId, () => fetchEpisodeListFromWeb(String(seriesId)), options.force);
+  return episodesCache('episodes:' + seriesId, () => fetchEpisodeListFromWeb(String(seriesId), options), options.force);
 }
 
 /**

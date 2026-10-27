@@ -174,3 +174,35 @@ test('the episode list comes from the current player object and must name the re
   model = { isSuccess: false };
   await assert.rejects(fetchEpisodeList(SID, { force: true }), /不一致/);
 });
+
+test('the episode list races the player and detail pages and retries a hung or failed round', async () => {
+  const SID = '7673067074104593432';
+  const page = (key, vids) => '<script>window._ROUTER_DATA = ' + JSON.stringify({ loaderData: { [key]: {
+    isSuccess: true, seriesDetail: { series_id: SID, series_name: '剧', vid_list: vids } } } }) + ';</script>';
+  // A request that never answers until it is cancelled, like a hung CDN edge.
+  const hang = options => new Promise((_, reject) => options.cancel.subscribe(() => reject(new Error('已取消'))));
+  const cancelled = [];
+  const hung = options => { options.cancel.subscribe(() => cancelled.push(true)); return hang(options); };
+
+  // The player page hangs; the detail page of the same series answers.
+  let calls = stub((u, options) => u.pathname === '/detail' ? { data: page('detail_page', ['21', '22']) } : hung(options));
+  let s = await fetchEpisodeList(SID, { force: true, hedgeMs: 5000 });
+  assert.deepEqual(s.episodes.map(e => e.vid), ['21', '22']);
+  assert.equal(calls.length, 2, 'one round asks both pages');
+  assert.equal(cancelled.length, 1, 'the hung player request is cancelled');
+
+  // The whole first round hangs; a second round on fresh connections answers.
+  let n = 0;
+  cancelled.length = 0;
+  calls = stub((u, options) => ++n <= 2 ? hung(options) : { data: page('player_(series_id)/page', ['31']) });
+  s = await fetchEpisodeList(SID, { force: true, hedgeMs: 30 });
+  assert.deepEqual(s.episodes.map(e => e.vid), ['31']);
+  assert.equal(cancelled.length, 2, 'the first round is cancelled once the second answers');
+
+  // Connection resets retry at once, three rounds at most, then say so in words.
+  calls = stub(() => { throw new Error('网络连接失败'); });
+  await assert.rejects(fetchEpisodeList(SID, { force: true, hedgeMs: 5000 }), /^Error: 红果分集加载超时或连接中断，请重试$/);
+  assert.equal(calls.length, 6);
+  calls = stub(u => u.pathname === '/detail' ? { status: 502, data: '' } : { data: page('detail_page', ['1']).replace(SID, '7000000000000000000') });
+  await assert.rejects(fetchEpisodeList(SID, { force: true, hedgeMs: 5000 }), /不一致/);
+});
