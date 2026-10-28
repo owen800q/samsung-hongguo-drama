@@ -50,6 +50,7 @@ export function Player({ series, index: startIndex, fromStart }) {
   const resumeFrom = useRef(0);
   const prefetched = useRef('');
   const prefetchToken = useRef(null);
+  const prefetchRetryAt = useRef(0);
   const skipResume = useRef(!!fromStart);
   const pendingReload = useRef(null); // { position } for the next load
   const autoReconnected = useRef(-1); // episode index already reconnected automatically
@@ -179,6 +180,7 @@ export function Player({ series, index: startIndex, fromStart }) {
         setTime({ current: v.currentTime, duration: v.duration || 0, buffered });
         const d = v.duration || 0;
         if (d && d - v.currentTime < 6 && settings.current.autoNext && nextRef.current >= 0) setUpNext(true);
+        if (started.current && !v.paused) warmNext();
       }),
       on('ended', () => {
         save(v.ended);
@@ -230,16 +232,25 @@ export function Player({ series, index: startIndex, fromStart }) {
   function warmNext() {
     if (!getSettings().cacheNext || nextRef.current < 0) return;
     const next = episodes[nextRef.current];
-    if (!next || prefetched.current === next.vid) return;
+    if (!next || prefetched.current === next.vid || Date.now() < prefetchRetryAt.current) return;
     cancelPrefetch();
     prefetched.current = next.vid;
-    prefetchToken.current = new CancelToken();
-    prefetch(next.vid, series.series_id, prefetchToken.current, getSettings().hongguoQuality);
+    const token = new CancelToken();
+    prefetchToken.current = token;
+    prefetch(next.vid, series.series_id, token, getSettings().hongguoQuality).then(ok => {
+      // A failed prefetch must not block the next episode for good: forget it and let
+      // playback progress (timeupdate) try again after a pause.
+      if (ok || token.cancelled || prefetchToken.current !== token) return;
+      prefetchToken.current = null;
+      prefetched.current = '';
+      prefetchRetryAt.current = Date.now() + 15000;
+    });
   }
   function cancelPrefetch() {
     if (prefetchToken.current) prefetchToken.current.cancel();
     prefetchToken.current = null;
     prefetched.current = '';
+    prefetchRetryAt.current = 0;
   }
 
   // ---------- actions ----------

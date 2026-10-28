@@ -126,3 +126,56 @@ export function rotr64(a, n) {
 }
 export const readU64LE = (b, o) => u64(readU32LE(b, o + 4), readU32LE(b, o));
 export function writeU64LE(b, v, o) { writeU32LE(b, v.lo, o); writeU32LE(b, v.hi, o + 4); }
+
+export function randomBytes(n) {
+  const out = new Uint8Array(n);
+  const c = typeof window !== 'undefined' && window.crypto && window.crypto.getRandomValues ? window.crypto
+    : (typeof globalThis !== 'undefined' && globalThis.crypto && globalThis.crypto.getRandomValues ? globalThis.crypto : null);
+  if (c) c.getRandomValues(out);
+  else for (let i = 0; i < n; i++) out[i] = Math.floor(Math.random() * 256);
+  return out;
+}
+
+/** Random RFC 4122 version 4 UUID string. */
+export function randomUuid() {
+  const b = randomBytes(16);
+  b[6] = (b[6] & 15) | 64;
+  b[8] = (b[8] & 63) | 128;
+  const h = toHex(b);
+  return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
+}
+
+let crcTable = null;
+export function crc32(bytes) {
+  if (!crcTable) {
+    crcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      crcTable[n] = c >>> 0;
+    }
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) crc = crcTable[(crc ^ bytes[i]) & 255] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/**
+ * gzip container around uncompressed ("stored") deflate blocks. Valid for any gunzip;
+ * the TV has no CompressionStream, and the payloads here are a few KB.
+ */
+export function gzipStored(data) {
+  const blocks = [];
+  for (let off = 0; off < data.length || off === 0; off += 65535) {
+    const len = Math.min(65535, data.length - off);
+    const head = new Uint8Array(5);
+    head[0] = off + len >= data.length ? 1 : 0;
+    head[1] = len & 255; head[2] = len >>> 8; head[3] = ~len & 255; head[4] = (~len >>> 8) & 255;
+    blocks.push(head, data.subarray(off, off + len));
+    if (!len) break;
+  }
+  const trailer = new Uint8Array(8);
+  writeU32LE(trailer, crc32(data), 0);
+  writeU32LE(trailer, data.length, 4);
+  return concat([new Uint8Array([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255])].concat(blocks, [trailer]));
+}

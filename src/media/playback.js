@@ -183,7 +183,7 @@ export async function resolvePlayback(vid, seriesId, options = {}) {
       for (let i = 0; i < candidates.length; i++) {
         try {
           const url = await prepareEncrypted(vid, candidates[i], quality, token, (p, l, t) => {
-            if (p === 'download' && Math.max(l, t) > job.maxBytes) token.cancel();
+            if (p === 'download' && Math.max(l, t) > job.maxBytes) { markTooLarge(vid, quality); token.cancel(); }
             job.progress && job.progress(p, l, t);
           });
           return { src: url, info: candidates[i], encrypted: true };
@@ -221,5 +221,14 @@ export async function resolvePlayback(vid, seriesId, options = {}) {
  * Cancelling `cancel` abandons the work unless the player has started using it. Never throws.
  */
 export function prefetch(vid, seriesId, cancel, quality) {
+  // Retrying a prefetch that hit the size cap would only download the same 48 MB again.
+  if (prefetchTooLarge.has(String(vid) + ':' + (quality || 'auto'))) return Promise.resolve(false);
   return resolvePlayback(vid, seriesId, { cancel, prefetch: true, quality }).then(() => true, () => false);
+}
+
+// Episodes (vid:quality) a prefetch gave up on for being larger than PREFETCH_MAX_BYTES.
+const prefetchTooLarge = new Set();
+function markTooLarge(vid, quality) {
+  if (prefetchTooLarge.size >= 256) prefetchTooLarge.clear();
+  prefetchTooLarge.add(vid + ':' + quality);
 }
