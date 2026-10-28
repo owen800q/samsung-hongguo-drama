@@ -12,6 +12,8 @@ import { focusElement, focusFirst } from '../lib/focus.js';
 const RATES = [0.75, 1, 1.25, 1.5, 2];
 const OSD_TIMEOUT = 5000;
 const SEEK_COMMIT_MS = 650;
+const PREFETCH_RETRY_MS = 15000;
+const PREFETCH_ATTEMPTS = 3;
 
 function phaseLabel(p, reconnecting) {
   if (!p) return '正在准备…';
@@ -50,6 +52,7 @@ export function Player({ series, index: startIndex, fromStart }) {
   const resumeFrom = useRef(0);
   const prefetched = useRef('');
   const prefetchToken = useRef(null);
+  const prefetchFailures = useRef({}); // vid -> { at, count }
   const skipResume = useRef(!!fromStart);
   const pendingReload = useRef(null); // { position } for the next load
   const autoReconnected = useRef(-1); // episode index already reconnected automatically
@@ -179,6 +182,7 @@ export function Player({ series, index: startIndex, fromStart }) {
         setTime({ current: v.currentTime, duration: v.duration || 0, buffered });
         const d = v.duration || 0;
         if (d && d - v.currentTime < 6 && settings.current.autoNext && nextRef.current >= 0) setUpNext(true);
+        if (started.current && !v.paused) warmNext();
       }),
       on('ended', () => {
         save(v.ended);
@@ -227,14 +231,24 @@ export function Player({ series, index: startIndex, fromStart }) {
 
   // ---------- next-episode cache ----------
   // Starts as soon as playback does, so switching episodes rarely waits on a download.
+  // A failed prefetch is let go and tried again from timeupdate after a pause, so one
+  // error does not leave the next episode uncached; a few failures give up on it.
   function warmNext() {
     if (!getSettings().cacheNext || nextRef.current < 0) return;
     const next = episodes[nextRef.current];
     if (!next || prefetched.current === next.vid) return;
+    const failed = prefetchFailures.current[next.vid];
+    if (failed && (failed.count >= PREFETCH_ATTEMPTS || Date.now() - failed.at < PREFETCH_RETRY_MS)) return;
     cancelPrefetch();
+    const token = new CancelToken();
     prefetched.current = next.vid;
-    prefetchToken.current = new CancelToken();
-    prefetch(next.vid, series.series_id, prefetchToken.current, getSettings().hongguoQuality);
+    prefetchToken.current = token;
+    prefetch(next.vid, series.series_id, token, getSettings().hongguoQuality).then(outcome => {
+      if (outcome !== 'failed' || prefetchToken.current !== token) return;
+      prefetchFailures.current[next.vid] = { at: Date.now(), count: (failed ? failed.count : 0) + 1 };
+      prefetchToken.current = null;
+      prefetched.current = '';
+    });
   }
   function cancelPrefetch() {
     if (prefetchToken.current) prefetchToken.current.cancel();

@@ -133,7 +133,7 @@ test('playback: prefetch hands off to the player and cancels when abandoned', as
   const dropped = new CancelToken();
   const abandoned = prefetch(s.episodes[10].vid, s.series_id, dropped);
   dropped.cancel();
-  assert.equal(await abandoned, false);
+  assert.equal(await abandoned, 'cancelled');
   // The player joins an in-flight prefetch; cancelling the prefetch afterwards keeps it going.
   const token = new CancelToken();
   const warm = prefetch(s.episodes[9].vid, s.series_id, token);
@@ -141,7 +141,7 @@ test('playback: prefetch hands off to the player and cancels when abandoned', as
   const playing = retry(() => resolvePlayback(s.episodes[9].vid, s.series_id, { onProgress: p => phases.add(p) }));
   token.cancel();
   const enc = await playing;
-  assert.equal(await warm, true);
+  assert.equal(await warm, 'ready');
   assert.equal(enc.encrypted, true);
   assert.ok(phases.has('decrypt'), Array.from(phases).join());
   release(s.episodes[9].vid);

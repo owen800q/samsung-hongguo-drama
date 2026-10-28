@@ -42,6 +42,8 @@ export const DEFAULT_SETTINGS = {
   seekStep: 10,
   cacheNext: true,
   hongguoQuality: 'auto',
+  // 'xifan' / 'hema' turned off in 设置: browsing and searching skip them.
+  disabledSources: [],
 };
 
 export function getSettings() {
