@@ -480,6 +480,101 @@ try {
   check('a protected preview page falls back to the App source', protPages > 0 && /^blob:/.test(protSrc) && protMedia.length === 0, protSrc + ' protected pages: ' + protPages + ', web hits: ' + protMedia.length);
   await prot.close();
 
+  // 设置 → 河马来源 off: 发现 and 搜索 no longer offer it; 红果 has no switch.
+  const srcs = await ctx.newPage();
+  await srcs.addInitScript(() => { window.tizen = { tvinputdevice: { registerKey() {} } }; });
+  srcs.on('pageerror', e => errors.push('source switch page: ' + e));
+  const srcFocused = () => srcs.evaluate(() => (document.activeElement.textContent || '').trim());
+  const srcPress = async (k, n = 1) => { for (let i = 0; i < n; i++) { await srcs.keyboard.press(k); await srcs.waitForTimeout(300); } };
+  const openTab = async name => {
+    await srcs.evaluate(n => document.querySelector('[data-sidebar-tab="' + n + '"]').focus(), name);
+    await srcPress('Enter');
+  };
+  await srcs.goto(URL_);
+  await srcs.waitForSelector('.sidebar-item', { timeout: 30000 });
+  await openTab('settings');
+  await srcs.waitForSelector('.settings', { timeout: 10000 });
+  for (let i = 0; i < 12 && !/河马来源/.test(await srcFocused()); i++) await srcPress('ArrowDown');
+  const rowValue = () => srcs.evaluate(() => { const v = document.activeElement.querySelector('.setting-value'); return v ? v.textContent : ''; });
+  const hemaBefore = await rowValue();
+  await srcPress('Enter');
+  const srcSaved = await srcs.evaluate(() => localStorage.getItem('hg.settings') || '');
+  check('the 河马 source switch is reachable with the remote, turns off and is saved',
+    /河马来源/.test(await srcFocused()) && hemaBefore === '开' && (await rowValue()) === '关' && /"disabledSources":\["hema"\]/.test(srcSaved),
+    hemaBefore + ' -> ' + (await rowValue()) + ' ' + srcSaved);
+  check('source switch rows fit the 1920 layout and 红果 has none', await srcs.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll('.setting-row'));
+    const r = document.activeElement.getBoundingClientRect();
+    return r.right <= 1920 && r.bottom <= 1080 && !rows.some(x => /红果来源/.test(x.textContent));
+  }));
+  const tabs = group => srcs.evaluate(g => Array.from(document.querySelectorAll('[data-focus-group="' + g + '"] .focusable')).map(t => t.textContent.trim()), group);
+  await openTab('browse');
+  await srcs.waitForSelector('[data-focus-group="browse-source"] .focusable', { timeout: 10000 });
+  check('发现 leaves out a source turned off', (await tabs('browse-source')).join() === '红果,西饭', (await tabs('browse-source')).join());
+  await openTab('search');
+  await srcs.waitForSelector('[data-focus-group="search-source"] .focusable', { timeout: 10000 });
+  check('搜索 leaves out a source turned off', (await tabs('search-source')).join() === '全部来源,红果,西饭', (await tabs('search-source')).join());
+  await openTab('settings');
+  await srcs.waitForSelector('.settings', { timeout: 10000 });
+  for (let i = 0; i < 12 && !/河马来源/.test(await srcFocused()); i++) await srcPress('ArrowDown');
+  await srcPress('Enter');
+  await openTab('browse');
+  await srcs.waitForSelector('[data-focus-group="browse-source"] .focusable', { timeout: 10000 });
+  check('turning the source back on brings it back', (await tabs('browse-source')).join() === '红果,西饭,河马', (await tabs('browse-source')).join());
+  await srcs.close();
+
+  // The next episode's prefetch fails: it is tried again while playing, after a pause.
+  const pre = await ctx.newPage();
+  await pre.addInitScript(() => { window.tizen = { tvinputdevice: { registerKey() {} } }; });
+  pre.on('pageerror', e => errors.push('prefetch retry page: ' + e));
+  await pre.route(/hongguoduanju\.com\/video\//, route => {
+    const m = /bytes=(\d+)-(\d*)/.exec(route.request().headers().range || '');
+    if (!m) return route.fulfill({ status: 200, contentType: 'video/webm', headers: { 'accept-ranges': 'bytes' }, body: clip });
+    const start = Number(m[1]); const end = m[2] ? Number(m[2]) : clip.length - 1;
+    return route.fulfill({ status: 206, contentType: 'video/webm', body: clip.subarray(start, end + 1),
+      headers: { 'accept-ranges': 'bytes', 'content-range': `bytes ${start}-${end}/${clip.length}` } });
+  });
+  // Episode pages by vid: the first one plays; the second fails (website and App) for 5 s.
+  const vids = [];
+  const nextHits = [];
+  let blockUntil = 0;
+  await pre.route(/hongguoduanju\.com\/player\/[^?]*\/\d+/, async route => {
+    const vid = /\/(\d+)(?:\?|$)/.exec(route.request().url())[1];
+    if (vids.indexOf(vid) < 0) vids.push(vid);
+    if (vids.indexOf(vid) === 1) {
+      nextHits.push(Date.now());
+      if (!blockUntil) blockUntil = Date.now() + 5000;
+      if (Date.now() < blockUntil) return route.abort('connectionreset');
+    }
+    try {
+      const res = await route.fetch();
+      await route.fulfill({ response: res, body: (await res.text()).replace(/"protectedPlayback":true/g, '"protectedPlayback":false') });
+    } catch (_) { /* request outlived the page */ }
+  });
+  await pre.route(/fqnovel\.com/, route => (blockUntil && Date.now() < blockUntil ? route.abort('connectionreset') : route.continue()));
+  await pre.goto(URL_);
+  await pre.waitForSelector('.poster.focusable', { timeout: 30000 });
+  await pre.evaluate(() => document.querySelector('.poster.focusable').focus());
+  await pre.keyboard.press('Enter');
+  await pre.waitForSelector('.detail .btn-primary:not([disabled])', { timeout: 30000 });
+  await pre.waitForTimeout(800);
+  await pre.keyboard.press('Enter');
+  await pre.waitForSelector('video.player-video', { timeout: 15000 });
+  const retryEnd = Date.now() + 60000;
+  while (Date.now() < retryEnd && !(blockUntil && nextHits.some(t => t >= blockUntil))) await pre.waitForTimeout(500);
+  const firstFail = nextHits[0] || 0;
+  const retried = nextHits.filter(t => t >= blockUntil);
+  check('a failed next-episode prefetch is tried again while playing, after a pause',
+    firstFail > 0 && retried.length > 0 && retried[0] - firstFail >= 14000, JSON.stringify({ vids: vids.length, hits: nextHits.map(t => t - firstFail) }));
+  // Live 红果 episodes may still fail after the block (preview-only pages, App source down):
+  // retries then stay 15 s apart and stop after three attempts.
+  await pre.waitForTimeout(Math.max(0, firstFail + 50000 - Date.now()));
+  // One attempt asks up to two page forms back to back.
+  const attempts = nextHits.filter((t, i) => i === 0 || t - nextHits[i - 1] > 5000);
+  check('prefetch retries stay spaced out and stop after three attempts',
+    attempts.length <= 3 && attempts.every((t, i) => i === 0 || t - attempts[i - 1] >= 14000), JSON.stringify(attempts.map(t => t - firstFail)));
+  await pre.close();
+
   // A hung CDN edge for the series' player page: the episode list comes from its detail page.
   const hung = await ctx.newPage();
   await hung.addInitScript(() => { window.tizen = { tvinputdevice: { registerKey() {} } }; });

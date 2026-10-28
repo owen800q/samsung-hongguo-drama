@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { useRouter } from '../router.js';
-import { SOURCES, browseCategories, browseList } from '../sources/index.js';
+import { browseCategories, browseList, enabledSources } from '../sources/index.js';
 import { getSettings } from '../lib/storage.js';
 import { errorMessage } from '../lib/format.js';
 import { TabRow } from '../components/TabRow.jsx';
@@ -9,7 +9,12 @@ import { Empty, PosterSkeleton, Spinner } from '../components/Status.jsx';
 
 export function Browse() {
   const router = useRouter();
-  const [source, setSource] = useState(() => getSettings().defaultSource || 'hongguo');
+  // 设置 is another tab, so a changed source switch remounts this screen.
+  const [sources] = useState(() => enabledSources());
+  const [source, setSource] = useState(() => {
+    const preferred = getSettings().defaultSource;
+    return sources.some(s => s.id === preferred) ? preferred : 'hongguo';
+  });
   const categories = browseCategories(source);
   const [category, setCategory] = useState(categories[0] ? categories[0].slug : '');
   const [genre, setGenre] = useState('');
@@ -56,7 +61,8 @@ export function Browse() {
   };
 
   // When a source's catalog is unreachable (红果 often is), offer the next one straight from the error.
-  const fallback = SOURCES[(SOURCES.findIndex(s => s.id === source) + 1) % SOURCES.length];
+  const next = sources[(sources.findIndex(s => s.id === source) + 1) % sources.length];
+  const fallback = next && next.id !== source ? next : null;
 
   const genreItems = ranking || !state.genres.length ? []
     : [{ value: '', label: source === 'xifan' ? '推荐' : '全部' }].concat(state.genres.map(g => ({ value: g.slug, label: g.label })));
@@ -66,7 +72,7 @@ export function Browse() {
       <header class="page-header">
         <h1 class="page-title">发现短剧</h1>
         <TabRow label="来源" group="browse-source" size="lg" autofocus
-          items={SOURCES.map(s => ({ value: s.id, label: s.label }))} value={source} onChange={changeSource} />
+          items={sources.map(s => ({ value: s.id, label: s.label }))} value={source} onChange={changeSource} />
       </header>
       {categories.length > 1 && (
         <TabRow label="分类" group="browse-category" items={categories.map(c => ({ value: c.slug, label: c.label }))}

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { useRouter, useKeys } from '../router.js';
-import { SOURCES, search } from '../sources/index.js';
+import { enabledSources, search } from '../sources/index.js';
 import { addSearch, clearSearches, getSearches } from '../lib/storage.js';
 import { SOURCE_LABEL, errorMessage } from '../lib/format.js';
 import { TabRow } from '../components/TabRow.jsx';
@@ -8,8 +8,6 @@ import { PosterGrid } from '../components/PosterGrid.jsx';
 import { Empty, PosterSkeleton, Spinner } from '../components/Status.jsx';
 import { Icon } from '../components/Icon.jsx';
 import { focusElement, focusFirst } from '../lib/focus.js';
-
-const SOURCE_ITEMS = [{ value: 'all', label: '全部来源' }].concat(SOURCES.map(s => ({ value: s.id, label: s.label })));
 
 // Sources also return loosely related series; those are ranked after the title matches,
 // results of a looser search (without punctuation, or the first clause) first.
@@ -28,6 +26,8 @@ export function Search() {
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState('');
   const [source, setSource] = useState('all');
+  // 设置 is another tab, so a changed source switch remounts this screen.
+  const [sourceItems] = useState(() => [{ value: 'all', label: '全部来源' }].concat(enabledSources().map(s => ({ value: s.id, label: s.label }))));
   const [recent, setRecent] = useState(getSearches);
   const [state, setState] = useState({ keyword: '', items: [], page: 0, hasMore: false, more: [], loading: false, error: '', notes: [] });
   const request = useRef(0);
@@ -109,7 +109,7 @@ export function Search() {
           autocomplete="off" autocorrect="off" spellcheck={false} enterkeyhint="search" aria-label="搜索剧名" />
         <button type="button" tabIndex={-1} class="btn btn-primary focusable" onClick={() => run(text, 1)}>搜索</button>
       </div>
-      <TabRow label="搜索来源" group="search-source" items={SOURCE_ITEMS} value={source} onChange={setSource} />
+      <TabRow label="搜索来源" group="search-source" items={sourceItems} value={source} onChange={setSource} />
       {!state.keyword && recent.length > 0 && (
         <section class="recent">
           <div class="section-head">

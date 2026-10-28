@@ -218,8 +218,11 @@ export async function resolvePlayback(vid, seriesId, options = {}) {
 
 /**
  * Warm up the next episode (address lookup, and download + decryption when needed).
- * Cancelling `cancel` abandons the work unless the player has started using it. Never throws.
+ * Cancelling `cancel` abandons the work unless the player has started using it. Never throws:
+ * resolves 'ready', 'cancelled' (abandoned, or past the prefetch size cap) or 'failed' (a
+ * lookup or download error a later attempt may get past).
  */
 export function prefetch(vid, seriesId, cancel, quality) {
-  return resolvePlayback(vid, seriesId, { cancel, prefetch: true, quality }).then(() => true, () => false);
+  return resolvePlayback(vid, seriesId, { cancel, prefetch: true, quality }).then(() => 'ready', error =>
+    (cancel && cancel.cancelled) || (error && (error.status === -1 || error.message === '已取消')) ? 'cancelled' : 'failed');
 }
