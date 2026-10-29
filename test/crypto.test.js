@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
-import { md5, sha512, sm3, Aes128, aes128CbcDecrypt, cencCtrInPlace } from '../src/lib/crypto.js';
-import { toBase64, fromBase64, fromHex, toHex, add64, rotr64, u64 } from '../src/lib/bytes.js';
+import zlib from 'node:zlib';
+import { md5, sha512, sm3, Aes128, aes128CbcDecrypt, aes128CbcEncrypt, cencCtrInPlace } from '../src/lib/crypto.js';
+import { toBase64, fromBase64, fromHex, toHex, add64, rotr64, u64, gzipStored, crc32 } from '../src/lib/bytes.js';
+import { registrationBody } from '../src/sources/playback-device.js';
 import { decryptMp4, clearVideoType } from '../src/media/cenc.js';
 
 const hex = b => Buffer.from(b).toString('hex');
@@ -86,4 +88,32 @@ test('an encrypted video entry keeps its real codec', () => {
   assert.throws(() => type(box('hvcC', Buffer.alloc(4)), sinf('avc1')), /原始编码/);
   assert.throws(() => type(box('avcC', Buffer.alloc(4)), box('hvcC', Buffer.alloc(4))), /原始编码/);
   assert.throws(() => type(sinf('vp09')), /原始编码/);
+});
+
+test('aes cbc encrypt matches node, with PKCS#7 padding', () => {
+  for (const n of [0, 1, 15, 16, 17, 160]) {
+    const key = crypto.randomBytes(16), iv = crypto.randomBytes(16), data = crypto.randomBytes(n);
+    const c = crypto.createCipheriv('aes-128-cbc', key, iv);
+    assert.equal(hex(aes128CbcEncrypt(key, iv, data)), hex(Buffer.concat([c.update(data), c.final()])));
+  }
+});
+
+test('stored gzip unpacks with zlib, across block boundaries', () => {
+  assert.equal(crc32(Buffer.from('123456789')), 0xcbf43926);
+  for (const n of [0, 1, 1000, 65535, 65536, 140000]) {
+    const data = crypto.randomBytes(n);
+    assert.equal(hex(zlib.gunzipSync(gzipStored(data))), hex(data));
+  }
+});
+
+test('device registration body decrypts to the gzipped app log', () => {
+  const body = registrationBody({ aid: 8662 }, 1700000000000);
+  assert.equal(hex(body.subarray(0, 6)), '746305100000');
+  const salt = fromHex('4dd4c2e6b83162090e52b3c7a6733ba41cb2462b829ab58a196b39db57177524f49baf7f08e8d68d26a72e37c1a95a2f1f05a51892aef2949732b62a38aadd58');
+  const derived = crypto.createHash('sha512').update(Buffer.concat([crypto.createHash('sha512').update(body.subarray(6, 38)).digest(), salt])).digest();
+  const d = crypto.createDecipheriv('aes-128-cbc', derived.subarray(0, 16), derived.subarray(16, 32));
+  const plain = Buffer.concat([d.update(body.subarray(38)), d.final()]);
+  const gz = plain.subarray(64);
+  assert.equal(hex(plain.subarray(0, 64)), crypto.createHash('sha512').update(gz).digest('hex'));
+  assert.deepEqual(JSON.parse(zlib.gunzipSync(gz)), { magic_tag: 'ss_app_log', header: { aid: 8662 }, _gen_time: 1700000000000 });
 });

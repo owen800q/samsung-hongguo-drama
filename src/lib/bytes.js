@@ -126,3 +126,37 @@ export function rotr64(a, n) {
 }
 export const readU64LE = (b, o) => u64(readU32LE(b, o + 4), readU32LE(b, o));
 export function writeU64LE(b, v, o) { writeU32LE(b, v.lo, o); writeU32LE(b, v.hi, o + 4); }
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+export function crc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 255] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+/** A valid gzip member using uncompressed (stored) deflate blocks: the TV has no zlib. */
+export function gzipStored(bytes) {
+  const blocks = Math.max(1, Math.ceil(bytes.length / 65535));
+  const out = new Uint8Array(10 + bytes.length + blocks * 5 + 8);
+  out.set([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255]);
+  let o = 10;
+  for (let b = 0; b < blocks; b++) {
+    const chunk = bytes.subarray(b * 65535, Math.min(bytes.length, (b + 1) * 65535));
+    out[o++] = b === blocks - 1 ? 1 : 0;
+    out[o++] = chunk.length & 255; out[o++] = chunk.length >>> 8;
+    out[o++] = ~chunk.length & 255; out[o++] = (~chunk.length >>> 8) & 255;
+    out.set(chunk, o);
+    o += chunk.length;
+  }
+  writeU32LE(out, crc32(bytes), o);
+  writeU32LE(out, bytes.length, o + 4);
+  return out;
+}
