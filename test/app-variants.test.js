@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { setTransport, HttpError } from '../src/lib/http.js';
 import { getPlayInfo } from '../src/sources/index.js';
 import { resolvePlayback, setPlayMaxBytes } from '../src/media/playback.js';
+import { resetPlaybackDevice } from '../src/sources/playback-device.js';
 
 const KEY = '0123456789abcdef0123456789abcdef';
 
@@ -39,6 +40,8 @@ function videoList() {
   };
 }
 
+const REGISTERED = { device_id_str: '4100000000000000001', install_id_str: '4100000000000000002' };
+
 /** Fakes the website (down), the App API and the media CDN; returns the requested URLs. */
 function fake({ outer, api, media = {} } = {}) {
   const requested = [];
@@ -46,8 +49,9 @@ function fake({ outer, api, media = {} } = {}) {
     requested.push(url);
     const reply = (status, data, type = 'application/json') => ({ status, data, url, header: n => (n === 'content-type' ? type : null) });
     if (/hongguoduanju\.com/.test(url)) return reply(500, '');
+    if (/device_register/.test(url)) return reply(200, JSON.stringify(REGISTERED));
     if (/api5-normal/.test(url)) {
-      if (api) return api();
+      if (api) return api(url);
       const vid = JSON.parse(new TextDecoder().decode(options.body)).mixed_video_id_map[1004][0];
       return reply(200, JSON.stringify({ code: 0, data: { [vid]: { video_model: JSON.stringify({ fallback_api: 'https://vas.snssdk.com/video/fallback' }) } } }));
     }
@@ -159,4 +163,64 @@ test('an episode too large for the TV memory moves on to another address, then s
   }
   assert.ok(aborted, 'the oversized download is aborted');
   assert.deepEqual(requested.filter(u => /qznovelvod/.test(u)), [MEDIA.main1080, MEDIA.backup1080, MEDIA.main720]);
+});
+
+// Upstream 3.9: the playback API now answers random per-request IDs with an empty body.
+test('app playback registers one anonymous device and sends it with every request', async () => {
+  resetPlaybackDevice();
+  const requested = fake();
+  await getPlayInfo('9000000000000000012', '', { force: true });
+  await getPlayInfo('9000000000000000013', '', { force: true });
+  assert.equal(requested.filter(u => /device_register/.test(u)).length, 1);
+  const calls = requested.filter(u => /api5-normal/.test(u)).map(u => new URL(u).searchParams);
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every(q => q.get('device_id') === REGISTERED.device_id_str && q.get('iid') === REGISTERED.install_id_str));
+  assert.ok(calls.every(q => /^[0-9a-f-]{36}$/.test(q.get('cdid'))));
+});
+
+test('the current inline model plays without asking the fallback address', async () => {
+  const requested = fake({ api: url => ({ status: 200, url, header: () => null,
+    data: JSON.stringify({ code: 0, data: { '9000000000000000014': { video_model: JSON.stringify({ video_list: [
+      { codec_type: 'h264', definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } },
+      { codec_type: 'bytevc1', definition: '1080p', main_url: MEDIA.main1080, vwidth: 1080, vheight: 1920, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } },
+    ] }) } } }) }) });
+  const info = await getPlayInfo('9000000000000000014', '', { force: true });
+  assert.deepEqual(info.variants.map(v => v.url), [MEDIA.main1080, MEDIA.main720]);
+  assert.ok(info.variants.every(v => v.contentKey === KEY));
+  assert.ok(!requested.some(u => /snssdk/.test(u)));
+});
+
+test('an inline stream without its key is not played as clear video', async () => {
+  fake({ api: url => ({ status: 200, url, header: () => null,
+    data: JSON.stringify({ code: 0, data: { '9000000000000000015': { video_model: { video_list: [
+      { codec_type: 'h264', definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280 },
+    ] } } } }) }) });
+  await assert.rejects(getPlayInfo('9000000000000000015', '', { force: true }), /均未提供播放地址/);
+  fake({ api: url => ({ status: 200, url, header: () => null,
+    data: JSON.stringify({ code: 0, data: { '9000000000000000016': { video_model: { video_list: [
+      { codec_type: 'h264', definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280, encrypt_info: { encrypt: false } },
+    ] } } } }) }) });
+  assert.equal((await getPlayInfo('9000000000000000016', '', { force: true })).contentKey, null);
+});
+
+test('a failed registration is shared, then retried after 30 s', async () => {
+  resetPlaybackDevice();
+  let registrations = 0;
+  setTransport(async url => {
+    if (/device_register/.test(url)) registrations++;
+    return { status: 200, data: /device_register/.test(url) ? '{"code":0}' : '', url, header: () => null };
+  });
+  const now = Date.now;
+  try {
+    await assert.rejects(getPlayInfo('9000000000000000017', '', { force: true }), /均未提供播放地址|设备注册失败/);
+    await assert.rejects(getPlayInfo('9000000000000000018', '', { force: true }));
+    assert.equal(registrations, 1);
+    const later = now() + 31000;
+    Date.now = () => later;
+    await assert.rejects(getPlayInfo('9000000000000000019', '', { force: true }));
+    assert.equal(registrations, 2);
+  } finally {
+    Date.now = now;
+    resetPlaybackDevice();
+  }
 });

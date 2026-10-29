@@ -287,6 +287,24 @@ export function aes128CbcDecrypt(key, iv, data) {
   return out;
 }
 
+/** AES-128-CBC encrypt with PKCS#7 padding. */
+export function aes128CbcEncrypt(key, iv, data) {
+  const aes = new Aes128(key);
+  const pad = 16 - (data.length % 16);
+  const out = new Uint8Array(data.length + pad);
+  out.set(data);
+  out.fill(pad, data.length);
+  let prev = iv;
+  let prevOff = 0;
+  for (let off = 0; off < out.length; off += 16) {
+    for (let i = 0; i < 16; i++) out[off + i] ^= prev[prevOff + i];
+    aes.encryptBlock(out, off, out, off);
+    prev = out;
+    prevOff = off;
+  }
+  return out;
+}
+
 /**
  * CENC (AES-CTR, 8-byte IV, 64-bit block counter from 0) decrypt in place, pure JS.
  * data[off .. off+len) is XORed with the keystream.
