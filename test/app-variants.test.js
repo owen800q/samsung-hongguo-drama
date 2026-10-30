@@ -224,3 +224,71 @@ test('a failed registration is shared, then retried after 30 s', async () => {
     resetPlaybackDevice();
   }
 });
+
+// Upstream 4.4: the API can answer one device with empty bodies mid-run while a new one works.
+function renewingTransport({ emptyFor = () => false, failRegistration = () => false } = {}) {
+  const log = { registrations: 0, devices: [] };
+  setTransport(async (url, options) => {
+    const reply = (status, data) => ({ status, data, url, header: n => (n === 'content-type' ? 'application/json' : null) });
+    if (/hongguoduanju\.com/.test(url)) return reply(500, '');
+    if (/device_register/.test(url)) {
+      log.registrations++;
+      if (failRegistration(log.registrations)) return reply(200, '{"code":0}');
+      return reply(200, JSON.stringify({ device_id_str: '42000000000000000' + String(log.registrations).padStart(2, '0'), install_id_str: '4300000000000000001' }));
+    }
+    if (/api5-normal/.test(url)) {
+      const device = new URL(url).searchParams.get('device_id');
+      log.devices.push(device);
+      if (emptyFor(device)) return reply(200, '');
+      const vid = JSON.parse(new TextDecoder().decode(options.body)).mixed_video_id_map[1004][0];
+      return reply(200, JSON.stringify({ code: 0, data: { [vid]: { video_model: { video_list: [
+        { codec_type: 'h264', definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } },
+      ] } } } }));
+    }
+    return reply(404, '');
+  });
+  return log;
+}
+
+test('an empty playback answer renews the device once and retries with the new one', async () => {
+  resetPlaybackDevice();
+  const log = renewingTransport({ emptyFor: device => device === '4200000000000000001' });
+  try {
+    const info = await getPlayInfo('9000000000000000020', '', { force: true });
+    assert.equal(info.url, MEDIA.main720);
+    assert.equal(log.registrations, 2);
+    assert.deepEqual(log.devices, ['4200000000000000001', '4200000000000000002']);
+    await getPlayInfo('9000000000000000021', '', { force: true });
+    assert.equal(log.registrations, 2, 'the renewed device is kept');
+  } finally {
+    resetPlaybackDevice();
+  }
+});
+
+test('device renewal is shared, at most once a minute, and a failed one keeps the old device', async () => {
+  resetPlaybackDevice();
+  const log = renewingTransport({ emptyFor: () => true });
+  const now = Date.now;
+  try {
+    await Promise.all(['9000000000000000022', '9000000000000000023'].map(vid =>
+      assert.rejects(getPlayInfo(vid, '', { force: true }), /均未提供播放地址/)));
+    assert.equal(log.registrations, 2, 'concurrent empty answers share one renewal');
+    await assert.rejects(getPlayInfo('9000000000000000024', '', { force: true }));
+    assert.equal(log.registrations, 2, 'no second renewal within a minute');
+    const later = now() + 61000;
+    Date.now = () => later;
+    await assert.rejects(getPlayInfo('9000000000000000025', '', { force: true }));
+    assert.equal(log.registrations, 3);
+  } finally {
+    Date.now = now;
+    resetPlaybackDevice();
+  }
+
+  const failing = renewingTransport({ emptyFor: device => device === '4200000000000000001', failRegistration: n => n === 2 });
+  await assert.rejects(getPlayInfo('9000000000000000026', '', { force: true }));
+  assert.equal(failing.registrations, 2);
+  await assert.rejects(getPlayInfo('9000000000000000027', '', { force: true }));
+  assert.equal(failing.registrations, 2, 'the old device is kept, still within the minute');
+  assert.deepEqual(failing.devices, ['4200000000000000001', '4200000000000000001']);
+  resetPlaybackDevice();
+});

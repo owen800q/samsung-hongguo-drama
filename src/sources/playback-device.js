@@ -6,6 +6,8 @@
 // TV changes: pure JS SHA-512/AES and stored-block gzip (no Node crypto or zlib), no
 // User-Agent header (browsers cannot set it), and a failed registration is retried after
 // 30 s instead of only after a restart, since a TV may open the app before its network is up.
+// Upstream 4.4: a device the playback API starts answering with empty bodies is replaced
+// once (at most once a minute) instead of being kept for the whole run.
 // Anonymous phone profile only: no login, cookies or tokens; the identity lives in memory.
 import { md5, sha512, aes128CbcEncrypt } from '../lib/crypto.js';
 import { utf8, toHex, fromHex, concat, gzipStored } from '../lib/bytes.js';
@@ -13,8 +15,10 @@ import { utf8, toHex, fromHex, concat, gzipStored } from '../lib/bytes.js';
 const REGISTER_URL = 'https://log5-applog-lf.fqnovel.com/service/2/device_register/?tt_data=a&cronet_version=8d40f833_2026-03-03&ttnet_version=4.2.243.31-douyin&use_store_region_cookie=1';
 const KDF_SALT = fromHex('4dd4c2e6b83162090e52b3c7a6733ba41cb2462b829ab58a196b39db57177524f49baf7f08e8d68d26a72e37c1a95a2f1f05a51892aef2949732b62a38aadd58');
 const RETRY_AFTER_MS = 30000;
+const RENEW_AFTER_MS = 60000;
 let registration = null;
 let failedAt = 0;
+let renewAfter = 0;
 
 function randomBytes(n) {
   const out = new Uint8Array(n);
@@ -100,8 +104,22 @@ export async function registerPlaybackDevice(requestJson) {
 /**
  * One anonymous identity per app run, shared by playback and prefetch. Concurrent callers
  * share one registration; a failure is kept for 30 s so retries do not register new devices.
+ * `rejected`: the identity the playback API answered with an empty body. It is replaced by a
+ * new registration at most once a minute; concurrent and late callers that report the same
+ * identity share that renewal, and a failed renewal keeps the old identity.
  */
-export function getPlaybackDevice(requestJson) {
+export function getPlaybackDevice(requestJson, rejected) {
+  if (rejected && registration && !failedAt) {
+    const previous = registration;
+    return previous.then(current => {
+      if (registration !== previous || current !== rejected || Date.now() < renewAfter) return registration;
+      renewAfter = Date.now() + RENEW_AFTER_MS;
+      const renewal = registerPlaybackDevice(requestJson);
+      registration = renewal;
+      renewal.catch(() => { if (registration === renewal) registration = previous; });
+      return renewal;
+    });
+  }
   if (registration && failedAt && Date.now() - failedAt >= RETRY_AFTER_MS) registration = null;
   if (!registration) {
     failedAt = 0;
@@ -116,4 +134,5 @@ export function getPlaybackDevice(requestJson) {
 export function resetPlaybackDevice() {
   registration = null;
   failedAt = 0;
+  renewAfter = 0;
 }

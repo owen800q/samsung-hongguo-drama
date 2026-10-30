@@ -5,6 +5,7 @@ import * as hongguo from './hongguo.js';
 import * as xifan from './xifan.js';
 import * as hema from './hema.js';
 import { findSequels, hasTitleMatch, rankResults, relaxedQueries, seasonTitle, supplementQueries } from './seasons.js';
+import { getSettings } from '../lib/storage.js';
 
 export const SOURCES = [
   { id: 'hongguo', label: '红果' },
@@ -13,6 +14,15 @@ export const SOURCES = [
 ];
 
 const ADAPTERS = { hongguo, xifan, hema };
+
+/** The sources not turned off in 设置 (`settings.disabledSources`); 红果 is always on. */
+export function enabledSources(settings) {
+  const off = (settings || getSettings()).disabledSources;
+  return SOURCES.filter(s => s.id === 'hongguo' || !Array.isArray(off) || off.indexOf(s.id) < 0);
+}
+
+const SOURCE_OFF = '此来源已关闭，可在设置中重新开启';
+const isEnabled = id => enabledSources().some(s => s.id === id);
 
 export function sourceOf(seriesId) {
   const id = String(seriesId || '');
@@ -59,7 +69,8 @@ export async function browseList(options = {}) {
   const page = Math.max(1, parseInt(options.page, 10) || 1);
   let data;
   try {
-    if (source === 'hongguo') data = await catalog.browseList({ category: options.category, genre: options.genre, page, forceRefresh: options.forceRefresh });
+    if (ADAPTERS[source] && !isEnabled(source)) data = { success: false, error: SOURCE_OFF };
+    else if (source === 'hongguo') data = await catalog.browseList({ category: options.category, genre: options.genre, page, forceRefresh: options.forceRefresh });
     else if (ADAPTERS[source]) data = await ADAPTERS[source].browseList({ genre: options.genre, page, forceRefresh: options.forceRefresh });
     else data = { success: false, error: '未知来源' };
   } catch (error) {
@@ -107,7 +118,9 @@ export async function search(keyword, options = {}) {
   if (!kw) return { success: false, results: [], hasMore: false, nextPage: null, errors: [], error: '请输入搜索关键词' };
   const page = Math.max(1, parseInt(options.page, 10) || 1);
   const deadline = options.deadline || Date.now() + SEARCH_BUDGET;
-  const wanted = !options.source || options.source === 'all' ? SOURCES.map(s => s.id) : [options.source];
+  const wanted = !options.source || options.source === 'all' ? enabledSources().map(s => s.id) : [options.source];
+  // Also covers 查找下一季 on a series from a source turned off since it was watched.
+  if (!isEnabled(wanted[0])) return { success: false, results: [], page, hasMore: false, nextPage: null, more: [], errors: [], error: SOURCE_OFF };
   const ids = page > 1 && Array.isArray(options.only) ? wanted.filter(id => options.only.indexOf(id) >= 0) : wanted;
   if (page > MAX_PAGE || !ids.length) return { success: true, results: [], page, hasMore: false, nextPage: null, more: [], errors: [], partial: false, supplementErrors: [], relaxed: [] };
   const primary = await searchSources(kw, ids, page, deadline);

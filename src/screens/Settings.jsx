@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { SOURCES } from '../sources/index.js';
+import { SOURCES, enabledSources } from '../sources/index.js';
 import { clearHistory, clearSearches, getSettings, saveSettings } from '../lib/storage.js';
 import { appVersion } from '../platform/tv.js';
 import { Dialog } from '../components/Dialog.jsx';
@@ -63,7 +63,15 @@ export function Settings() {
       toast(message, kind);
     });
   };
-  const sourceLabel = (SOURCES.find(x => x.id === s.defaultSource) || SOURCES[0]).label;
+  const enabled = enabledSources(s);
+  const sourceLabel = (enabled.find(x => x.id === s.defaultSource) || SOURCES[0]).label;
+  const isOn = id => enabled.some(x => x.id === id);
+  // Turning off the default source makes 红果 the default again.
+  const toggleSource = id => {
+    const off = (Array.isArray(s.disabledSources) ? s.disabledSources : []).filter(x => x !== id);
+    if (isOn(id)) off.push(id);
+    set(Object.assign({ disabledSources: off }, isOn(id) && s.defaultSource === id ? { defaultSource: 'hongguo' } : null));
+  };
 
   return (
     <div class="page" data-scroll="y" data-scroll-pad="160">
@@ -81,7 +89,11 @@ export function Settings() {
         <h2 class="section-title">浏览</h2>
         <div class="settings-group">
           <Row label="默认来源" hint="打开「发现」时首先显示的来源" value={sourceLabel}
-            onSelect={() => set({ defaultSource: cycle(SOURCES.map(x => x.id), s.defaultSource) })} />
+            onSelect={() => set({ defaultSource: cycle(enabled.map(x => x.id), s.defaultSource) })} />
+          {SOURCES.filter(x => x.id !== 'hongguo').map(x => (
+            <Row key={x.id} label={x.label + '来源'} hint={'关闭后「发现」和搜索不再使用' + x.label + '；已在观看记录和追剧里的剧照常播放。红果固定开启'}
+              value={isOn(x.id) ? '开' : '关'} onSelect={() => toggleSource(x.id)} />
+          ))}
           <Row label="清空搜索记录" onSelect={() => { clearSearches(); toast('搜索记录已清空'); }} />
           <Row label="清空观看记录" hint="追剧列表不受影响" onSelect={() => setConfirm(true)} />
         </div>
