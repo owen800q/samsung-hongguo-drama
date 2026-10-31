@@ -292,3 +292,11 @@ test('device renewal is shared, at most once a minute, and a failed one keeps th
   assert.deepEqual(failing.devices, ['4200000000000000001', '4200000000000000001']);
   resetPlaybackDevice();
 });
+
+test('a chosen quality with no compatible stream at all says so instead of blaming the quality', async () => {
+  fake({ outer: { code: 0, video_info: { code: 0, data: { video_list: {
+    video_1: { codec_type: 'av1', definition: '1080p', main_url: 'https://v1.qznovelvod.com/av1.mp4', vwidth: 1080, vheight: 1920, spade_a: spadeFor(KEY) },
+  } } } } });
+  await assert.rejects(getPlayInfo('9000000000000000011', '', { force: true, quality: '1080p' }),
+    err => /兼容的 H\.264\/HEVC.*设置/.test(err.message) && !/1080P/.test(err.message));
+});
