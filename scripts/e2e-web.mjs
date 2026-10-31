@@ -155,7 +155,27 @@ try {
   for (let i = cur; i < target; i++) await key(39);
   check('focus on encrypted episode ' + target, (await focused()).includes(String(target)), await focused());
 
-  // Fail the best App address: the player must fall back to the next one.
+  // Fail the best App address: the player must fall back to the next one. Some episodes now
+  // list a single usable address, so every stream gets a missing address in front to fail.
+  await page.route(/api5-normal/, async route => {
+    const response = await route.fetch();
+    let body = await response.text();
+    try {
+      const json = JSON.parse(body);
+      Object.keys(json.data || {}).forEach(vid => {
+        const entry = json.data[vid];
+        const model = typeof entry.video_model === 'string' ? JSON.parse(entry.video_model) : entry.video_model;
+        (model && Array.isArray(model.video_list) ? model.video_list : []).forEach(item => {
+          if (typeof item.main_url !== 'string') return;
+          item.backup_url_list = [item.main_url].concat(item.backup_url_list || []);
+          item.main_url = item.main_url.replace(/(qznovelvod|fqnovelvod|douyinvod)\.com\//, '$1.com/e2e-missing/');
+        });
+        entry.video_model = typeof entry.video_model === 'string' ? JSON.stringify(model) : model;
+      });
+      body = JSON.stringify(json);
+    } catch (_) { /* not a playback answer */ }
+    return route.fulfill({ response, body });
+  });
   const mediaHits = [];
   let failed = false;
   await page.route(/(qznovelvod|fqnovelvod|douyinvod)\.com/, async route => {
@@ -173,6 +193,7 @@ try {
   const sub = await page.textContent('.player-sub');
   check('player shows the episode', sub.includes('第 ' + target + ' 集'), sub);
   await page.unroute(/(qznovelvod|fqnovelvod|douyinvod)\.com/);
+  await page.unroute(/api5-normal/);
 
   // Leave: player → detail → home → exit dialog → exit.
   for (let i = 0; i < 6 && (await page.$('video.player-video, .detail')); i++) { await key(10009); await page.waitForTimeout(500); }
@@ -537,19 +558,21 @@ try {
   // Episode pages by vid: the first one plays; the second fails (website and App) for 5 s.
   const vids = [];
   const nextHits = [];
+  const nextEnds = [];
   let blockUntil = 0;
   await pre.route(/hongguoduanju\.com\/player\/[^?]*\/\d+/, async route => {
     const vid = /\/(\d+)(?:\?|$)/.exec(route.request().url())[1];
     if (vids.indexOf(vid) < 0) vids.push(vid);
-    if (vids.indexOf(vid) === 1) {
-      nextHits.push(Date.now());
+    const hit = vids.indexOf(vid) === 1 ? nextHits.push(Date.now()) - 1 : -1;
+    if (hit >= 0) {
       if (!blockUntil) blockUntil = Date.now() + 5000;
-      if (Date.now() < blockUntil) return route.abort('connectionreset');
+      if (Date.now() < blockUntil) { nextEnds[hit] = Date.now(); return route.abort('connectionreset'); }
     }
     try {
       const res = await route.fetch();
       await route.fulfill({ response: res, body: (await res.text()).replace(/"protectedPlayback":true/g, '"protectedPlayback":false') });
     } catch (_) { /* request outlived the page */ }
+    if (hit >= 0) nextEnds[hit] = Date.now();
   });
   await pre.route(/fqnovel\.com/, route => (blockUntil && Date.now() < blockUntil ? route.abort('connectionreset') : route.continue()));
   await pre.goto(URL_);
@@ -569,8 +592,9 @@ try {
   // Live 红果 episodes may still fail after the block (preview-only pages, App source down):
   // retries then stay 15 s apart and stop after three attempts.
   await pre.waitForTimeout(Math.max(0, firstFail + 50000 - Date.now()));
-  // One attempt asks up to two page forms back to back.
-  const attempts = nextHits.filter((t, i) => i === 0 || t - nextHits[i - 1] > 5000);
+  // One attempt asks up to two page forms back to back, the second once the first has
+  // answered (which on a slow live page can take several seconds).
+  const attempts = nextHits.filter((t, i) => i === 0 || t - (nextEnds[i - 1] || nextHits[i - 1]) > 5000);
   check('prefetch retries stay spaced out and stop after three attempts',
     attempts.length <= 3 && attempts.every((t, i) => i === 0 || t - attempts[i - 1] >= 14000), JSON.stringify(attempts.map(t => t - firstFail)));
   await pre.close();

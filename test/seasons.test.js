@@ -61,3 +61,20 @@ test('sequels: same source, same base, higher explicit season, in season order',
   assert.deepEqual(found.map(x => x.series_id), ['103', '104']);
   assert.deepEqual(findSequels({ series_id: '1', series_title: '剧名第零季' }, [{ series_id: '2', series_title: '剧名第二季' }], sourceOf), []);
 });
+
+test('upstream 5.0 season spellings: no 第, bracketed seasons and 部', () => {
+  for (const suffix of ['第2季', '第二季', '2季', '二季', '二部', '（第二季）', '(2部)', '(第2部)', 'season 2']) {
+    assert.deepEqual(seasonTitle('游戏入侵' + suffix), { base: '游戏入侵', season: 2, explicit: true }, suffix);
+  }
+  // Years, zero, large bare numbers and a whole title that is only a number stay plain titles.
+  for (const title of ['剧名（2024）', '剧名(0)', '剧名(100)', '剧名(二〇二四)', '剧名(一百)', '剧名2024部', '四季', '(第三季)']) {
+    assert.equal(seasonTitle(title).explicit, false, title);
+  }
+  assert.equal(seasonTitle('剧名第0季').invalid, true);
+  assert.equal(seasonTitle('剧名第一百零二部').season, 102);
+  const series = { series_id: '200', series_title: '游戏入侵' };
+  assert.deepEqual(findSequels(series, [
+    { series_id: '202', series_title: '游戏入侵(3部)' },
+    { series_id: '201', series_title: '游戏入侵2季' },
+  ], sourceOf).map(s => s.series_id), ['201', '202']);
+});

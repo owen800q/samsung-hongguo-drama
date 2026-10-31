@@ -171,7 +171,7 @@ export async function fetchAppPlayUrl(vid, options = {}) {
   // Samsung TVs decode HEVC in hardware, so resolution still outranks codec here
   // (the desktop app now prefers H.264 because it may have to transcode HEVC). The real
   // size outranks the quality label, which is sometimes wrong or missing.
-  const rows = Object.keys(list).map(k => list[k]).filter(item => item && (item.main_url || item.backup_url || Array.isArray(item.backup_url_list))).map(item => {
+  const compatible = Object.keys(list).map(k => list[k]).filter(item => item && (item.main_url || item.backup_url || Array.isArray(item.backup_url_list))).map(item => {
     const meta = item.video_meta || {};
     const codec = str(item.codec_type || meta.codec_type).toLowerCase();
     const codecRank = ['h264', 'avc', 'avc1'].indexOf(codec) >= 0 ? 0 : ['hevc', 'h265', 'hvc1', 'hev1', 'bytevc1'].indexOf(codec) >= 0 ? 1 : 2;
@@ -179,12 +179,15 @@ export async function fetchAppPlayUrl(vid, options = {}) {
     const pm = quality.match(/\d+/);
     const edge = shortEdge(item);
     return { item, codec, codecRank, quality, edge, pixels: edge || Number(pm ? pm[0] : 0) };
-  }).filter(row => row.codecRank < 2 && (wanted === 'auto' || row.edge >= parseInt(wanted, 10))).sort((a, b) => wanted === 'auto'
+  }).filter(row => row.codecRank < 2);
+  const rows = compatible.filter(row => wanted === 'auto' || row.edge >= parseInt(wanted, 10)).sort((a, b) => wanted === 'auto'
     ? b.pixels - a.pixels || a.codecRank - b.codecRank
     : a.edge - b.edge || a.codecRank - b.codecRank);
   if (!rows.length) {
-    throw Object.assign(new Error(wanted === 'auto' ? '本集暂未提供兼容的 H.264/HEVC 片源'
-      : '本集暂无可确认为 ' + wanted.toUpperCase() + ' 的片源，未自动降级'), { quality: wanted !== 'auto' });
+    // Upstream 4.7: only blame the chosen quality when compatible streams exist at other sizes.
+    const strict = compatible.length > 0 && wanted !== 'auto';
+    throw Object.assign(new Error(strict ? '本集暂无可确认为 ' + wanted.toUpperCase() + ' 的片源，未自动降级'
+      : '本集暂未提供兼容的 H.264/HEVC 片源'), { code: strict ? 'QUALITY_UNAVAILABLE' : 'NO_COMPATIBLE_SOURCE', quality: wanted !== 'auto' });
   }
   // Every usable address, best first: a stream's main address, then its backups, then the
   // next stream. The player falls back along this list when a download fails.

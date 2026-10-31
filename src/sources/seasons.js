@@ -23,11 +23,13 @@ function chineseNumber(value) {
  */
 export function seasonTitle(title) {
   const text = normalizeTitle(title);
-  const m = text.match(/^(.*?)(?:第([一二三四五六七八九十百零两\d]+)[季部]|[（(]([一二三四五六七八九十百零两\d]+)[）)]|season(\d+))$/i);
+  // Upstream 5.0 also reads "2季", "二部", "（第二季）" and "(2部)".
+  const m = text.match(/^(.*?)(?:(第)?([一二三四五六七八九十百零两\d]+)[季部]|[（(](?:第)?([一二三四五六七八九十百零两\d]+)(?:[季部])?[）)]|season(\d+))$/i);
   if (!m) return { base: text, season: 1, explicit: false };
-  const season = chineseNumber(m[2] || m[3] || m[4]);
-  // Bare bracket numbers can be years or other title metadata; accept only modest season numbers.
-  if (m[3] && season > 99) return { base: text, season: 1, explicit: false };
+  const season = chineseNumber(m[3] || m[4] || m[5]);
+  // Bracket numbers and a number without 第 can be years or other title metadata; accept only
+  // modest season numbers there, and never a whole title like "四季".
+  if ((m[4] || (m[3] && !m[2])) && (season > 99 || !m[1])) return { base: text, season: 1, explicit: false };
   if (!Number.isSafeInteger(season) || season < 1) return { base: text, season: 1, explicit: false, invalid: true };
   return { base: m[1], season, explicit: true };
 }
