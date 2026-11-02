@@ -213,9 +213,11 @@ export async function fetchAppPlayUrl(vid, options = {}) {
         const identity = url + ':' + (contentKey || '');
         if (seen[identity]) continue;
         seen[identity] = true;
+        const codec = selected.codec === 'bytevc1' ? 'hevc' : selected.codec;
         variants.push({
-          url, contentKey,
-          codec: selected.codec === 'bytevc1' ? 'hevc' : selected.codec, quality: selected.quality, source: 'app',
+          url, contentKey, codec, quality: selected.quality, source: 'app',
+          // One stream's addresses share this; the player skips a stream the TV failed to decode.
+          stream: codec + '|' + (selected.edge || selected.quality),
         });
       } catch (error) { lastError = error; }
     }

@@ -300,3 +300,29 @@ test('a chosen quality with no compatible stream at all says so instead of blami
   await assert.rejects(getPlayInfo('9000000000000000011', '', { force: true, quality: '1080p' }),
     err => /兼容的 H\.264\/HEVC.*设置/.test(err.message) && !/1080P/.test(err.message));
 });
+
+// Upstream 4.8: in auto quality the player swaps a stream the TV cannot decode for the next one.
+test('a stream the TV could not decode is skipped with all its addresses', async () => {
+  const requested = fake({ outer: { code: 0, video_info: { code: 0, data: { video_list: sizedList() } } } });
+  const info = await getPlayInfo('9000000000000000020', '', { force: true });
+  assert.deepEqual(info.variants.map(v => v.stream), ['h264|1080p', 'hevc|1080', 'hevc|1080', 'hevc|720']);
+  // Without the skip the unsized stream and the 1080P stream's two addresses fill all 3 attempts.
+  await assert.rejects(resolvePlayback('9000000000000000020', '', {}), /HTTP 404/);
+  await assert.rejects(resolvePlayback('9000000000000000020', '', { skip: ['h264|1080p'] }), /HTTP 404/);
+  await assert.rejects(resolvePlayback('9000000000000000020', '', { skip: ['h264|1080p', 'hevc|1080'] }), /HTTP 404/);
+  assert.deepEqual(requested.filter(u => /qznovelvod/.test(u)), [
+    'https://v1.qznovelvod.com/unsized.mp4', MEDIA.main1080, MEDIA.backup1080,
+    MEDIA.main1080, MEDIA.backup1080, MEDIA.main720,
+    MEDIA.main720,
+  ]);
+});
+
+test('with every stream skipped the player is told there is no other one', async () => {
+  const requested = fake({ outer: { code: 0, video_info: { code: 0, data: { video_list: sizedList() } } } });
+  await assert.rejects(resolvePlayback('9000000000000000021', '', { force: true, skip: ['hevc|1080', 'h264|1080p', 'hevc|720'] }), err => {
+    assert.equal(err.code, 'NO_OTHER_STREAM');
+    assert.match(err.message, /无法解码/);
+    return true;
+  });
+  assert.equal(requested.filter(u => /qznovelvod/.test(u)).length, 0);
+});

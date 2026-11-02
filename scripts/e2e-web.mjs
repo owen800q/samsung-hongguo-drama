@@ -501,6 +501,85 @@ try {
   check('a protected preview page falls back to the App source', protPages > 0 && /^blob:/.test(protSrc) && protMedia.length === 0, protSrc + ' protected pages: ' + protPages + ', web hits: ' + protMedia.length);
   await prot.close();
 
+  // Upstream 4.8: in auto quality a decrypted App stream the TV cannot decode is swapped for
+  // the next stream down, at most twice, then the error is shown with 重试 focused. This
+  // Chromium has no HEVC/H.264 decoder but drops such a video track and plays the audio;
+  // a TV reports a decode error instead, so a blob that loads without a picture gets one.
+  const swap = await ctx.newPage();
+  await swap.addInitScript(() => {
+    window.tizen = { tvinputdevice: { registerKey() {} }, application: { getCurrentApplication: () => ({ exit() {} }) } };
+    document.addEventListener('loadstart', e => { delete e.target.error; }, true);
+    document.addEventListener('loadedmetadata', e => {
+      const v = e.target;
+      if (v.tagName !== 'VIDEO' || !/^blob:/.test(v.currentSrc) || v.videoWidth) return;
+      v.pause();
+      Object.defineProperty(v, 'error', { configurable: true, get: () => ({ code: 3 }) });
+      v.dispatchEvent(new Event('error'));
+    }, true);
+  });
+  swap.on('pageerror', e => errors.push('stream switch: ' + e));
+  const streamIds = new Set();
+  const countStreams = list => (Array.isArray(list) ? list : Object.values(list || {})).forEach(item => {
+    const meta = (item && item.video_meta) || {};
+    const codec = String(item.codec_type || meta.codec_type || '').toLowerCase();
+    if (!/^(h264|avc1?|hevc|h265|hvc1|hev1|bytevc1)$/.test(codec) || !(item.main_url || item.backup_url || item.backup_url_list)) return;
+    const w = item.vwidth || item.width || meta.vwidth || meta.width; const h = item.vheight || item.height || meta.vheight || meta.height;
+    streamIds.add((codec === 'bytevc1' || codec === 'h265' ? 'hevc' : codec) + '|' + (w && h ? Math.min(w, h) : item.definition || meta.definition));
+  });
+  await swap.route(/api5-normal|vas\.snssdk\.com/, async route => {
+    const response = await route.fetch();
+    const body = await response.text();
+    try {
+      const json = JSON.parse(body);
+      Object.values(json.data || {}).forEach(entry => {
+        const model = typeof entry.video_model === 'string' ? JSON.parse(entry.video_model) : entry.video_model;
+        if (model && model.video_list) countStreams(model.video_list);
+      });
+      if (json.video_info && json.video_info.data) countStreams(json.video_info.data.video_list);
+    } catch (_) { /* not a playback answer */ }
+    return route.fulfill({ response, body });
+  });
+  await swap.route(/hongguoduanju\.com\/video\//, route => route.abort());
+  await swap.route(/hongguoduanju\.com\/player\/[^?]*\/\d+/, async route => {
+    try {
+      const res = await route.fetch();
+      const body = (await res.text()).replace(/"protectedPlayback":(true|false),?/g, '').replace(/"publicVideoSeo":/g, '"protectedPlayback":true,"publicVideoSeo":');
+      await route.fulfill({ response: res, body });
+    } catch (_) { /* a prefetch still in flight when the page closes */ }
+  });
+  await swap.goto(URL_);
+  await swap.waitForSelector('.poster.focusable', { timeout: 30000 });
+  await swap.evaluate(() => document.querySelector('.poster.focusable').focus());
+  await swap.keyboard.press('Enter');
+  await swap.waitForSelector('.detail .btn-primary:not([disabled])', { timeout: 30000 });
+  await swap.waitForTimeout(600);
+  await swap.keyboard.press('Enter');
+  const blobs = new Set();
+  let switchLabel = false;
+  const swapEnd = Date.now() + 300000;
+  while (Date.now() < swapEnd) {
+    await swap.waitForTimeout(250);
+    const st = await swap.evaluate(() => {
+      const v = document.querySelector('video.player-video');
+      const l = document.querySelector('.player-loading');
+      return { src: v ? v.currentSrc || v.src : '', loading: l ? l.textContent : '', error: !!document.querySelector('.player-error') };
+    });
+    if (/^blob:/.test(st.src)) blobs.add(st.src);
+    if (/换用其他清晰度/.test(st.loading)) switchLabel = true;
+    if (st.error) break;
+  }
+  const swapError = await swap.evaluate(() => {
+    const e = document.querySelector('.player-error');
+    const r = e && e.getBoundingClientRect();
+    return e ? { text: e.querySelector('.player-error-text').textContent, focused: (document.activeElement.textContent || '').trim(),
+      fits: r.left >= 0 && r.top >= 0 && r.right <= 1920 && r.bottom <= 1080 } : null;
+  });
+  const expectedTries = Math.min(streamIds.size, 3);
+  check('an undecodable App stream is swapped for the next one, at most twice, then 重试 is focused',
+    streamIds.size > 0 && blobs.size === expectedTries && (expectedTries < 2 || switchLabel) && !!swapError && /无法解码/.test(swapError.text) && swapError.focused === '重试' && swapError.fits,
+    JSON.stringify({ streams: Array.from(streamIds), played: blobs.size, switchLabel, error: swapError }));
+  await swap.close();
+
   // 设置 → 河马来源 off: 发现 and 搜索 no longer offer it; 红果 has no switch.
   const srcs = await ctx.newPage();
   await srcs.addInitScript(() => { window.tizen = { tvinputdevice: { registerKey() {} } }; });
