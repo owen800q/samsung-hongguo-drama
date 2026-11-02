@@ -14,9 +14,15 @@ const OSD_TIMEOUT = 5000;
 const SEEK_COMMIT_MS = 650;
 const PREFETCH_RETRY_MS = 15000;
 const PREFETCH_ATTEMPTS = 3;
+// Upstream 4.8: in auto quality, a 红果 App stream the TV cannot decode is swapped for the
+// next one down (1080P → 720P → another codec), at most this many times per episode.
+const MAX_STREAM_SWITCHES = 2;
 
 function phaseLabel(p, reconnecting) {
   if (!p) return '正在准备…';
+  if (reconnecting === 'stream' && (p.phase === 'fetch' || p.phase === 'download')) {
+    return '电视无法解码当前清晰度，正在换用其他清晰度' + (p.total ? ' ' + Math.floor(p.loaded / p.total * 100) + '%' : '…');
+  }
   if (p.phase === 'fetch') return reconnecting ? '正在重新获取本集片源…' : '正在获取播放地址…';
   if (p.phase === 'download') return p.total ? '正在缓冲片源 ' + Math.floor(p.loaded / p.total * 100) + '%' : '正在缓冲片源…';
   if (p.phase === 'decrypt' || p.phase === 'store') return '正在处理片源…';
@@ -40,7 +46,7 @@ export function Player({ series, index: startIndex, fromStart }) {
   const [upNext, setUpNext] = useState(false);
   // Bumped to reload the current episode with a fresh address (retry / reconnect).
   const [reload, setReload] = useState(0);
-  const [reconnecting, setReconnecting] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false); // false | true | 'stream'
   // Shown with the controls: the actual decoded size (not the source's best quality) and a clock.
   const [picture, setPicture] = useState({ width: 0, height: 0 });
   const [now, setNow] = useState(() => new Date());
@@ -56,6 +62,7 @@ export function Player({ series, index: startIndex, fromStart }) {
   const skipResume = useRef(!!fromStart);
   const pendingReload = useRef(null); // { position } for the next load
   const autoReconnected = useRef(-1); // episode index already reconnected automatically
+  const skippedStreams = useRef({ index: -1, streams: [] }); // App streams the TV failed to decode
 
   const episodes = series.episodes;
   const episode = episodes[index];
@@ -84,6 +91,8 @@ export function Player({ series, index: startIndex, fromStart }) {
   const loadedEpisode = useRef(null);
   // Where that media came from ('web' is the 红果 website's CDN).
   const loadedSource = useRef('');
+  // The App stream in it ('' for other sources), see switchStream.
+  const loadedStream = useRef('');
   function save(ended) {
     const v = video.current;
     const ep = loadedEpisode.current;
@@ -109,18 +118,22 @@ export function Player({ series, index: startIndex, fromStart }) {
     showOsd(true);
     const reloadRequest = pendingReload.current;
     pendingReload.current = null;
-    setReconnecting(!!reloadRequest);
+    setReconnecting(reloadRequest ? (reloadRequest.stream ? 'stream' : true) : false);
     if (!reloadRequest) autoReconnected.current = -1;
+    if (skippedStreams.current.index !== index) skippedStreams.current = { index, streams: [] };
     const history = getHistoryEntry(series.series_id);
     const saved = history && history.positions ? Number(history.positions[episode.vid]) || 0 : 0;
     resumeFrom.current = reloadRequest ? reloadRequest.position : skipResume.current ? 0 : saved;
     skipResume.current = false;
     loadedEpisode.current = episode;
     loadedSource.current = '';
+    loadedStream.current = '';
     const resolving = resolvePlayback(episode.vid, series.series_id, {
       cancel: token,
-      force: !!reloadRequest,
+      // A stream switch keeps the addresses just looked up; it only plays another one.
+      force: !!reloadRequest && !reloadRequest.stream,
       quality: getSettings().hongguoQuality,
+      skip: skippedStreams.current.streams.slice(),
       onProgress: (phase, loaded, total) => { if (!token.cancelled) setProgress({ phase, loaded, total }); },
     });
     // Drop the previous episode's prefetch only after this episode joined it, so a
@@ -130,6 +143,7 @@ export function Player({ series, index: startIndex, fromStart }) {
       if (token.cancelled) return;
       handle = result;
       loadedSource.current = result.source;
+      loadedStream.current = result.encrypted ? result.stream : '';
       v.src = result.src;
       v.playbackRate = rate;
       v.load();
@@ -193,6 +207,7 @@ export function Player({ series, index: startIndex, fromStart }) {
       on('error', () => {
         if (!v.getAttribute('src')) return;
         const code = v.error && v.error.code;
+        if ((code === 3 || code === 4) && switchStream()) return;
         // An unavailable HTTP stream is also reported as an unsupported source (4). The
         // reconnect then tries the App source first, with the website as a last resort.
         const webUnavailable = loadedSource.current === 'web' && (code === 2 || code === 4);
@@ -200,7 +215,7 @@ export function Player({ series, index: startIndex, fromStart }) {
         if ((code === 2 || webUnavailable) && reconnect(true)) return;
         setStatus('error');
         setError(webUnavailable && code === 4 ? '片源暂时无法播放，请重试'
-          : code === 4 ? '电视无法解码这一集的片源格式' : code === 2 ? '网络中断，片源没有加载完成' : '播放出错了，请重试');
+          : code === 3 || code === 4 ? '电视无法解码这一集的片源格式' : code === 2 ? '网络中断，片源没有加载完成' : '播放出错了，请重试');
         showOsd(true);
       }),
     ];
@@ -292,8 +307,26 @@ export function Player({ series, index: startIndex, fromStart }) {
     const i = indexRef.current;
     if (auto && autoReconnected.current === i) return false;
     autoReconnected.current = auto ? i : -1;
+    // A manual retry starts again from the best stream.
+    if (!auto) skippedStreams.current = { index: i, streams: [] };
     const v = video.current;
     pendingReload.current = { position: v && v.currentTime > 0 ? v.currentTime : resumeFrom.current };
+    setReload(n => n + 1);
+    return true;
+  }
+
+  /**
+   * In auto quality, replace an App stream the TV could not decode with the episode's next
+   * one, keeping the position. A chosen 720P/1080P is never changed, and other sources
+   * (one stream each) keep the existing error.
+   */
+  function switchStream() {
+    const stream = loadedStream.current;
+    const skipped = skippedStreams.current;
+    if (!stream || getSettings().hongguoQuality !== 'auto' || skipped.streams.length >= MAX_STREAM_SWITCHES) return false;
+    skipped.streams.push(stream);
+    const v = video.current;
+    pendingReload.current = { position: v && v.currentTime > 0 ? v.currentTime : resumeFrom.current, stream: true };
     setReload(n => n + 1);
     return true;
   }

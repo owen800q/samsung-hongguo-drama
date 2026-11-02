@@ -19,10 +19,11 @@ const blobs = new Map(); // vid -> { url, size, used, meta, quality, dispose }
 const inflight = new Map(); // vid -> { promise, token, users }
 let fileSeq = 0;
 
-function touchBlob(vid, quality) {
+function touchBlob(vid, quality, skip) {
   let entry = blobs.get(vid);
-  // An episode decrypted at another quality setting is not what the viewer chose now.
-  if (entry && entry.quality !== quality) { release(vid); entry = null; }
+  // An episode decrypted at another quality setting is not what the viewer chose now, and
+  // a stream the TV could not decode is not played again.
+  if (entry && (entry.quality !== quality || skip.indexOf(entry.meta.stream) >= 0)) { release(vid); entry = null; }
   if (entry) { blobs.delete(vid); entry.used = Date.now(); blobs.set(vid, entry); }
   return entry;
 }
@@ -118,8 +119,8 @@ async function prepareEncrypted(vid, info, quality, token, onProgress) {
 // quality down), at most this many in total.
 const MAX_TRANSFERS = 3;
 
-function encryptedCandidates(info) {
-  const list = [info].concat(info.variants || []).filter(v => v && v.url && v.contentKey);
+function encryptedCandidates(info, skip) {
+  const list = [info].concat(info.variants || []).filter(v => v && v.url && v.contentKey && skip.indexOf(v.stream) < 0);
   const seen = {};
   return list.filter(v => {
     const identity = v.url + ':' + v.contentKey;
@@ -143,6 +144,7 @@ function result(src, info, encrypted, vid) {
     codec: info.codec || '',
     quality: info.quality || '',
     source: info.source || '',
+    stream: info.stream || '',
     // Encrypted blobs stay cached for quick re-entry; callers release() them explicitly
     // or rely on the LRU. revoke() frees it immediately.
     revoke: () => { if (encrypted) release(vid); },
@@ -150,9 +152,11 @@ function result(src, info, encrypted, vid) {
 }
 
 /**
- * resolvePlayback(vid, seriesId, { cancel, onProgress(phase, loaded, total), force, quality })
+ * resolvePlayback(vid, seriesId, { cancel, onProgress(phase, loaded, total), force, quality, skip })
  * phase: 'fetch' (address lookup), 'download', 'decrypt'. `quality` is the 红果 setting
- * ('auto', '720p', '1080p'); other sources ignore it.
+ * ('auto', '720p', '1080p'); other sources ignore it. `skip` lists App streams (a result's
+ * `stream`) the TV failed to decode; when no other stream is left it rejects with code
+ * NO_OTHER_STREAM.
  * `force` reconnects: it drops the cached episode and any in-flight work, and looks the
  * address up again.
  */
@@ -161,24 +165,27 @@ export async function resolvePlayback(vid, seriesId, options = {}) {
   const onProgress = options.onProgress;
   const force = !!options.force;
   const quality = options.quality || 'auto';
+  const skip = options.skip || [];
+  const skipKey = skip.join(',');
   if (force) release(vid);
-  const cached = touchBlob(vid, quality);
+  const cached = touchBlob(vid, quality, skip);
   if (cached) return result(cached.url, cached.meta, true, vid);
 
   let job = inflight.get(vid);
   // Reconnecting abandons work that was started with the old address.
-  if (job && ((force && !job.force) || job.quality !== quality)) job.token.cancel();
+  if (job && ((force && !job.force) || job.quality !== quality || job.skipKey !== skipKey)) job.token.cancel();
   // A job already cancelled (e.g. a prefetch that hit its size cap) is only winding down.
   if (job && job.token.cancelled) job = null;
   if (!job) {
     const token = new CancelToken();
-    job = { token, users: 0, force, quality, maxBytes: options.prefetch ? PREFETCH_MAX_BYTES : Infinity };
+    job = { token, users: 0, force, quality, skipKey, maxBytes: options.prefetch ? PREFETCH_MAX_BYTES : Infinity };
     job.promise = (async () => {
       job.progress && job.progress('fetch', 0, 0);
       const info = await getPlayInfo(vid, seriesId, { force, quality });
       if (token.cancelled) throw new Error('已取消');
       if (!info.contentKey) return { src: info.url, info, encrypted: false };
-      const candidates = encryptedCandidates(info);
+      const candidates = encryptedCandidates(info, skip);
+      if (!candidates.length) throw Object.assign(new Error('电视无法解码这一集的片源格式，也没有其他清晰度可换'), { code: 'NO_OTHER_STREAM' });
       let firstError = null;
       for (let i = 0; i < candidates.length; i++) {
         try {
