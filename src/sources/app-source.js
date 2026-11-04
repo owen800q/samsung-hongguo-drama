@@ -3,15 +3,19 @@
 // commit 22261adfa31435e3b3ef5a730b8a2a75bcaf1715, spider/js/红果果[短].js,
 // via N3urda/hongguoTV eea73e6a45569a2cbbb9440f7cd5290c459b0b70, and the desktop
 // hongguo-drama app. TV changes: Uint8Array instead of Buffer, pure JS hashes, and no
-// User-Agent header (browsers cannot set it). Since upstream 3.9 playback uses a registered
-// anonymous device (playback-device.js) instead of signed requests with random IDs.
+// User-Agent header (browsers cannot set it). Playback uses a freshly registered anonymous
+// device (playback-device.js, upstream 3.9/5.5) and signed requests (app-signing.js, 5.4).
 // SDK protocol constants below are not user credentials.
 import { request } from '../lib/http.js';
 import { getPlaybackDevice } from './playback-device.js';
+import { branchOf, signatureHeaders } from './app-signing.js';
 import { sha512, aes128CbcDecrypt } from '../lib/crypto.js';
 import { utf8, fromUtf8, fromHex, fromBase64, concat } from '../lib/bytes.js';
 
-const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
+const VIDEO_PATH = '/novel/player/multi_video_model/v1/';
+const VIDEO_HOST = 'api5-normal-sinfonlineb.fqnovel.com';
+// Upstream 5.5: one more attempt on this host after an empty body.
+const ALTERNATE_VIDEO_HOST = 'api5-normal-hl.fqnovel.com';
 const DEVICE = {
   ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
   version_code: '71332', version_name: '7.1.3.32', device_platform: 'android', os: 'android',
@@ -32,13 +36,28 @@ function pythonUrlEncode(values) {
     return encode(key) + '=' + encode(values[key]);
   }).join('&');
 }
-// Upstream 3.9: with a registered device identity this endpoint answers unsigned requests;
-// with per-request random IDs it now answers HTTP 200 with an empty body.
-function playbackRequest(payload, identity) {
-  const query = pythonUrlEncode(Object.assign({}, DEVICE, identity, { _rticket: String(Date.now()) }));
-  return { url: VIDEO_API + '?' + query, body: utf8(payload), headers: {
+// Upstream 5.4 signs playback requests again: unsigned ones now get HTTP 200 with an empty
+// body. The signature covers the final query, the POST body and the timestamp, so it is
+// rebuilt for every attempt and host. Like upstream, jitter _rticket until the server would
+// pick signature branch 0.
+export function playbackRequest(payload, identity, host = VIDEO_HOST) {
+  const body = utf8(payload);
+  const khronos = Math.floor(Date.now() / 1000);
+  const ticketBase = Date.now();
+  const device = Object.assign({}, DEVICE, identity);
+  let url = '';
+  let ticket = ticketBase;
+  for (let n = 0; ; n++) {
+    ticket = ticketBase + n;
+    url = 'https://' + host + VIDEO_PATH + '?' + pythonUrlEncode(Object.assign({}, device, { ts: String(khronos), _rticket: String(ticket) }));
+    if (branchOf(url, body, khronos) === 0) break;
+    if (n === 127) throw new Error('无法生成播放请求签名');
+  }
+  return { url, body, headers: Object.assign({
     Accept: 'application/json; charset=utf-8,application/x-protobuf', 'Content-Type': 'application/json; charset=UTF-8',
-  } };
+    'x-ss-req-ticket': String(ticket), 'sdk-version': '2', 'x-xs-from-web': '0', 'x-tt-dt': '',
+    'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did',
+  }, signatureHeaders(url, body, khronos, device)) };
 }
 function parseFallback(value) {
   if (typeof value === 'string') { const parsed = jsonBody(value); return (parsed && parsed.fallback_api) || value; }
@@ -121,6 +140,9 @@ function shortEdge(item) {
   return 0;
 }
 
+function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function businessRejected() { return new Error('App 接口暂未提供本集播放信息'); }
+
 /**
  * `options.quality`: 'auto' (best first) or '720p' / '1080p'. A chosen quality only uses
  * streams whose size confirms it, closest first, and never falls back to a lower one.
@@ -129,43 +151,68 @@ export async function fetchAppPlayUrl(vid, options = {}) {
   vid = String(vid || '');
   const wanted = options.quality === '720p' || options.quality === '1080p' ? options.quality : 'auto';
   if (!/^\d{1,30}$/.test(vid)) throw new Error('分集编号无效');
-  const deadline = Date.now() + 15000;
   const payload = JSON.stringify({
     biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false, need_all_video_definition: true, need_mp4_align: false, use_os_player: false, use_server_dns: false, video_platform: 1024 },
     mixed_video_id_map: { 1004: [vid] },
   });
-  // Upstream 4.4: the API can start answering one device with empty bodies mid-run, while a
-  // newly registered one works. Renew the device once and retry, if enough time is left.
+  // Upstream 5.5: a registered identity may only be good for one playback request, so each
+  // lookup registers its own. Registration has its own 8 s budget, outside the 12 s below.
   let identity = await getPlaybackDevice(requestJson);
+  const deadline = Date.now() + 12000;
   let response;
   for (let attempt = 0; ; attempt++) {
-    const signed = playbackRequest(payload, identity);
+    const signed = playbackRequest(payload, identity, attempt ? ALTERNATE_VIDEO_HOST : VIDEO_HOST);
     try {
       response = await requestJson(signed.url, { method: 'POST', headers: signed.headers, body: signed.body }, deadline);
       break;
     } catch (error) {
-      if (attempt || !error.empty || deadline - Date.now() < 8000) throw error;
-      const renewed = await getPlaybackDevice(requestJson, identity);
-      if (renewed === identity) throw error;
-      identity = renewed;
+      // An empty body gets one more try on the other host, with a new identity when time allows.
+      if (attempt || !error.empty || deadline - Date.now() < 1000) throw error;
+      if (deadline - Date.now() >= 8000) {
+        try { identity = await getPlaybackDevice(requestJson); } catch (_) { /* keep the previous identity */ }
+      }
+      if (deadline - Date.now() < 500) throw error;
+      await wait(300);
     }
   }
-  if (Number(response.Code || response.code || 0) !== 0) throw new Error('App 接口暂未提供本集播放信息');
+  if (Number(response.Code || response.code || 0) !== 0) throw businessRejected();
   const entry = response.data && response.data[vid];
   const model = entry && (typeof entry.video_model === 'string' ? jsonBody(entry.video_model) : entry.video_model);
   if (!model) throw new Error('App 接口未返回所选分集');
-  // The current model lists the streams directly; older ones only point to a fallback_api.
-  const inline = Array.isArray(model.video_list) && model.video_list.length > 0;
-  let info = model;
-  if (!inline) {
+  const readFallback = async () => {
     const fallback = parseFallback(model.fallback_api);
     if (!fallback) throw new Error('App 接口未返回本集片源地址');
     const outer = await requestJson(fallback, {}, deadline);
-    if ([outer, outer.video_info].some(value => Number((value && (value.Code || value.code)) || 0) !== 0)) {
-      throw new Error('App 接口暂未提供本集播放信息');
+    if ([outer, outer.video_info].some(value => Number((value && (value.Code || value.code)) || 0) !== 0)) throw businessRejected();
+    return outer.video_info && outer.video_info.data;
+  };
+  // The current model lists the streams directly; older ones only point to a fallback_api.
+  const inline = Array.isArray(model.video_list) && model.video_list.length > 0;
+  if (!inline) return parsePlayModel(await readFallback(), wanted, false, 0);
+  try {
+    return parsePlayModel(model, wanted, true, 0);
+  } catch (error) {
+    // Upstream 5.5: an inline model whose streams carry no encryption info at all may still
+    // be read from its fallback_api, once. That model must be the same video with the same
+    // full length, state its encryption, and offer nothing smaller than the inline stream.
+    const duration = Number(model.video_duration);
+    if (!error.missingEncryptionInfo || !error.minimumEdge || typeof model.video_id !== 'string' || !model.video_id.trim()
+      || !isFinite(duration) || duration <= 0 || !model.fallback_api) throw error;
+    const info = await readFallback();
+    const fallbackDuration = Number(info && info.video_duration);
+    if (!info || info.video_id !== model.video_id || !isFinite(fallbackDuration) || fallbackDuration <= 0
+      || Math.abs(fallbackDuration - duration) > 0.5) {
+      throw new Error('备用片源编号或完整时长无法确认，已停止取址');
     }
-    info = outer.video_info && outer.video_info.data;
+    return parsePlayModel(info, wanted, true, error.minimumEdge);
   }
+}
+
+/**
+ * Every usable stream address in a play model, best first. `requireEncryptionInfo`: a stream
+ * without a key must say it is not encrypted. `minimumEdge`: ignore smaller streams.
+ */
+function parsePlayModel(info, wanted, requireEncryptionInfo, minimumEdge) {
   if (!info) throw new Error('App 接口未返回本集片源模型');
   const list = info.video_list || {};
   // Samsung TVs decode HEVC in hardware, so resolution still outranks codec here
@@ -179,7 +226,7 @@ export async function fetchAppPlayUrl(vid, options = {}) {
     const pm = quality.match(/\d+/);
     const edge = shortEdge(item);
     return { item, codec, codecRank, quality, edge, pixels: edge || Number(pm ? pm[0] : 0) };
-  }).filter(row => row.codecRank < 2);
+  }).filter(row => row.codecRank < 2 && (!minimumEdge || row.edge >= minimumEdge));
   const rows = compatible.filter(row => wanted === 'auto' || row.edge >= parseInt(wanted, 10)).sort((a, b) => wanted === 'auto'
     ? b.pixels - a.pixels || a.codecRank - b.codecRank
     : a.edge - b.edge || a.codecRank - b.codecRank);
@@ -192,6 +239,7 @@ export async function fetchAppPlayUrl(vid, options = {}) {
   // Every usable address, best first: a stream's main address, then its backups, then the
   // next stream. The player falls back along this list when a download fails.
   let lastError = null;
+  let missingEncryptionInfo = false;
   const variants = [];
   const seen = {};
   for (let r = 0; r < rows.length; r++) {
@@ -207,7 +255,10 @@ export async function fetchAppPlayUrl(vid, options = {}) {
           const encryptInfo = selected.item.encrypt_info || {};
           const spade = selected.item.spade_a || encryptInfo.spade_a;
           // An inline stream is encrypted unless it says otherwise: never play it as clear.
-          if (inline && !spade && [false, 0, '0', 'false'].indexOf(encryptInfo.encrypt) < 0) throw new Error('本集片源缺少有效解密信息');
+          if (requireEncryptionInfo && !spade && [false, 0, '0', 'false'].indexOf(encryptInfo.encrypt) < 0) {
+            if (encryptInfo.encrypt == null) missingEncryptionInfo = true;
+            throw new Error('本集片源缺少有效解密信息');
+          }
           contentKey = spade ? deriveContentKey(spade) : null;
         }
         const identity = url + ':' + (contentKey || '');
@@ -223,5 +274,7 @@ export async function fetchAppPlayUrl(vid, options = {}) {
     }
   }
   if (variants.length) return Object.assign({}, variants[0], { variants });
-  throw lastError || new Error('本集暂未提供有效片源地址');
+  const error = lastError || new Error('本集暂未提供有效片源地址');
+  if (missingEncryptionInfo) { error.missingEncryptionInfo = true; error.minimumEdge = rows[0].edge; }
+  throw error;
 }

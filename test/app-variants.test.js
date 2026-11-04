@@ -5,6 +5,8 @@ import { setTransport, HttpError } from '../src/lib/http.js';
 import { getPlayInfo } from '../src/sources/index.js';
 import { resolvePlayback, setPlayMaxBytes } from '../src/media/playback.js';
 import { resetPlaybackDevice } from '../src/sources/playback-device.js';
+import { playbackRequest } from '../src/sources/app-source.js';
+import { branchOf } from '../src/sources/app-signing.js';
 
 const KEY = '0123456789abcdef0123456789abcdef';
 
@@ -165,17 +167,40 @@ test('an episode too large for the TV memory moves on to another address, then s
   assert.deepEqual(requested.filter(u => /qznovelvod/.test(u)), [MEDIA.main1080, MEDIA.backup1080, MEDIA.main720]);
 });
 
-// Upstream 3.9: the playback API now answers random per-request IDs with an empty body.
-test('app playback registers one anonymous device and sends it with every request', async () => {
+// Upstream 5.5: one registered identity per playback lookup, since one may be single-use.
+test('each app playback lookup registers its own anonymous device and sends it', async () => {
   resetPlaybackDevice();
   const requested = fake();
   await getPlayInfo('9000000000000000012', '', { force: true });
   await getPlayInfo('9000000000000000013', '', { force: true });
-  assert.equal(requested.filter(u => /device_register/.test(u)).length, 1);
+  assert.equal(requested.filter(u => /device_register/.test(u)).length, 2);
   const calls = requested.filter(u => /api5-normal/.test(u)).map(u => new URL(u).searchParams);
   assert.equal(calls.length, 2);
   assert.ok(calls.every(q => q.get('device_id') === REGISTERED.device_id_str && q.get('iid') === REGISTERED.install_id_str));
   assert.ok(calls.every(q => /^[0-9a-f-]{36}$/.test(q.get('cdid'))));
+});
+
+// Upstream 5.4: unsigned playback requests get empty bodies again.
+test('playback requests are signed over the final query, body and timestamp', async () => {
+  const identity = { device_id: REGISTERED.device_id_str, iid: REGISTERED.install_id_str, cdid: '00000000-0000-4000-8000-000000000000' };
+  const payload = '{"mixed_video_id_map":{"1004":["9000000000000000099"]}}';
+  for (const host of ['api5-normal-sinfonlineb.fqnovel.com', 'api5-normal-hl.fqnovel.com']) {
+    const signed = playbackRequest(payload, identity, host);
+    const url = new URL(signed.url);
+    assert.equal(url.hostname, host);
+    assert.equal(url.pathname, '/novel/player/multi_video_model/v1/');
+    const khronos = Number(signed.headers['x-khronos']);
+    assert.equal(url.searchParams.get('ts'), String(khronos));
+    assert.equal(url.searchParams.get('_rticket'), signed.headers['x-ss-req-ticket']);
+    assert.equal(url.searchParams.get('device_id'), identity.device_id);
+    assert.equal(branchOf(signed.url, signed.body, khronos), 0, 'the request uses signature branch 0');
+    assert.match(signed.headers['x-gorgon'], /^8404[0-9a-f]{4}4001[0-9a-f]{40}$/);
+    assert.equal(Buffer.from(signed.headers['x-ladon'], 'base64').readUInt32BE(0), khronos);
+    assert.equal(Buffer.from(signed.headers['x-argus'], 'base64').readUInt32LE(0), khronos);
+    assert.ok(Buffer.from(signed.headers['x-helios'], 'base64').length >= 36);
+    assert.ok(Buffer.from(signed.headers['x-medusa'], 'base64').length > 300);
+    assert.equal(new TextDecoder().decode(signed.body), payload);
+  }
 });
 
 test('the current inline model plays without asking the fallback address', async () => {
@@ -225,9 +250,9 @@ test('a failed registration is shared, then retried after 30 s', async () => {
   }
 });
 
-// Upstream 4.4: the API can answer one device with empty bodies mid-run while a new one works.
+// Upstream 5.5: an empty answer gets one more try on the alternate host, with a new device.
 function renewingTransport({ emptyFor = () => false, failRegistration = () => false } = {}) {
-  const log = { registrations: 0, devices: [] };
+  const log = { registrations: 0, devices: [], hosts: [] };
   setTransport(async (url, options) => {
     const reply = (status, data) => ({ status, data, url, header: n => (n === 'content-type' ? 'application/json' : null) });
     if (/hongguoduanju\.com/.test(url)) return reply(500, '');
@@ -239,6 +264,7 @@ function renewingTransport({ emptyFor = () => false, failRegistration = () => fa
     if (/api5-normal/.test(url)) {
       const device = new URL(url).searchParams.get('device_id');
       log.devices.push(device);
+      log.hosts.push(new URL(url).hostname);
       if (emptyFor(device)) return reply(200, '');
       const vid = JSON.parse(new TextDecoder().decode(options.body)).mixed_video_id_map[1004][0];
       return reply(200, JSON.stringify({ code: 0, data: { [vid]: { video_model: { video_list: [
@@ -250,7 +276,7 @@ function renewingTransport({ emptyFor = () => false, failRegistration = () => fa
   return log;
 }
 
-test('an empty playback answer renews the device once and retries with the new one', async () => {
+test('an empty playback answer retries once on the alternate host with a new device', async () => {
   resetPlaybackDevice();
   const log = renewingTransport({ emptyFor: device => device === '4200000000000000001' });
   try {
@@ -258,39 +284,74 @@ test('an empty playback answer renews the device once and retries with the new o
     assert.equal(info.url, MEDIA.main720);
     assert.equal(log.registrations, 2);
     assert.deepEqual(log.devices, ['4200000000000000001', '4200000000000000002']);
-    await getPlayInfo('9000000000000000021', '', { force: true });
-    assert.equal(log.registrations, 2, 'the renewed device is kept');
+    assert.deepEqual(log.hosts, ['api5-normal-sinfonlineb.fqnovel.com', 'api5-normal-hl.fqnovel.com']);
   } finally {
     resetPlaybackDevice();
   }
 });
 
-test('device renewal is shared, at most once a minute, and a failed one keeps the old device', async () => {
+test('a lookup tries at most two hosts, and keeps its device when re-registration fails', async () => {
   resetPlaybackDevice();
   const log = renewingTransport({ emptyFor: () => true });
-  const now = Date.now;
-  try {
-    await Promise.all(['9000000000000000022', '9000000000000000023'].map(vid =>
-      assert.rejects(getPlayInfo(vid, '', { force: true }), /均未提供播放地址/)));
-    assert.equal(log.registrations, 2, 'concurrent empty answers share one renewal');
-    await assert.rejects(getPlayInfo('9000000000000000024', '', { force: true }));
-    assert.equal(log.registrations, 2, 'no second renewal within a minute');
-    const later = now() + 61000;
-    Date.now = () => later;
-    await assert.rejects(getPlayInfo('9000000000000000025', '', { force: true }));
-    assert.equal(log.registrations, 3);
-  } finally {
-    Date.now = now;
-    resetPlaybackDevice();
-  }
+  await assert.rejects(getPlayInfo('9000000000000000022', '', { force: true }), /均未提供播放地址/);
+  assert.equal(log.devices.length, 2, 'one alternate-host attempt only');
+  resetPlaybackDevice();
 
   const failing = renewingTransport({ emptyFor: device => device === '4200000000000000001', failRegistration: n => n === 2 });
-  await assert.rejects(getPlayInfo('9000000000000000026', '', { force: true }));
+  await assert.rejects(getPlayInfo('9000000000000000026', '', { force: true }), /均未提供播放地址/);
   assert.equal(failing.registrations, 2);
-  await assert.rejects(getPlayInfo('9000000000000000027', '', { force: true }));
-  assert.equal(failing.registrations, 2, 'the old device is kept, still within the minute');
-  assert.deepEqual(failing.devices, ['4200000000000000001', '4200000000000000001']);
+  assert.deepEqual(failing.devices, ['4200000000000000001', '4200000000000000001'], 'the alternate host still gets the first device');
+  assert.deepEqual(failing.hosts, ['api5-normal-sinfonlineb.fqnovel.com', 'api5-normal-hl.fqnovel.com']);
   resetPlaybackDevice();
+});
+
+// Upstream 5.5 (PR #92): inline streams with no encryption info may be read from fallback_api.
+function inlineWithoutKeys(vid, fallbackData, model = {}) {
+  const requested = fake({
+    api: url => ({ status: 200, url, header: () => null, data: JSON.stringify({ code: 0, data: { [vid]: { video_model: Object.assign({
+      video_id: 'v0abc', video_duration: 61.2, fallback_api: 'https://vas.snssdk.com/video/fallback',
+      video_list: [{ codec_type: 'h264', definition: '1080p', main_url: MEDIA.main1080, vwidth: 1080, vheight: 1920 }],
+    }, model) } } }) }),
+    outer: { code: 0, video_info: { code: 0, data: fallbackData } },
+  });
+  return requested;
+}
+
+test('inline streams without encryption info are read from the checked fallback model', async () => {
+  const fallbackStreams = {
+    video_1: { codec_type: 'h264', definition: '1080p', main_url: MEDIA.backup1080, vwidth: 1080, vheight: 1920, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } },
+    // Smaller than the inline stream: never offered.
+    video_2: { codec_type: 'h264', definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } },
+  };
+  const requested = inlineWithoutKeys('9000000000000000060', { video_id: 'v0abc', video_duration: 61.4, video_list: fallbackStreams });
+  const info = await getPlayInfo('9000000000000000060', '', { force: true });
+  assert.deepEqual(info.variants.map(v => v.url), [MEDIA.backup1080]);
+  assert.equal(info.contentKey, KEY);
+  assert.equal(requested.filter(u => /snssdk/.test(u)).length, 1);
+
+  // Another video, another length, or a model that still hides its encryption: refused.
+  for (const [vid, data] of [
+    ['9000000000000000061', { video_id: 'v0other', video_duration: 61.2, video_list: fallbackStreams }],
+    ['9000000000000000062', { video_id: 'v0abc', video_duration: 10, video_list: fallbackStreams }],
+    ['9000000000000000063', { video_id: 'v0abc', video_duration: 61.2, video_list: { video_1: { codec_type: 'h264', definition: '1080p', main_url: MEDIA.backup1080, vwidth: 1080, vheight: 1920 } } }],
+    ['9000000000000000064', { video_id: 'v0abc', video_duration: 61.2, video_list: { video_2: fallbackStreams.video_2 } }],
+  ]) {
+    inlineWithoutKeys(vid, data);
+    await assert.rejects(getPlayInfo(vid, '', { force: true }), /均未提供播放地址/, vid);
+  }
+});
+
+test('an inline stream that states an unusable encryption does not ask the fallback model', async () => {
+  const requested = inlineWithoutKeys('9000000000000000065', { video_id: 'v0abc', video_duration: 61.2, video_list: videoList() }, {
+    video_list: [{ codec_type: 'h264', definition: '1080p', main_url: MEDIA.main1080, vwidth: 1080, vheight: 1920, encrypt_info: { encrypt: true } }],
+  });
+  await assert.rejects(getPlayInfo('9000000000000000065', '', { force: true }), /均未提供播放地址/);
+  assert.ok(!requested.some(u => /snssdk/.test(u)));
+  const unsized = inlineWithoutKeys('9000000000000000066', { video_id: 'v0abc', video_duration: 61.2, video_list: videoList() }, {
+    video_list: [{ codec_type: 'h264', definition: '1080p', main_url: MEDIA.main1080 }],
+  });
+  await assert.rejects(getPlayInfo('9000000000000000066', '', { force: true }), /均未提供播放地址/);
+  assert.ok(!unsized.some(u => /snssdk/.test(u)), 'the inline size must be known to compare against');
 });
 
 test('a chosen quality with no compatible stream at all says so instead of blaming the quality', async () => {
