@@ -221,11 +221,15 @@ async function fetchPlayInfoFresh(vid, sid, skipWeb) {
     if (web) return web;
   }
   if (appError && appError.network) throw new Error('网络连接失败，未能获取播放地址，请检查电视网络后重试');
+  // Upstream 5.6: an episode that only exists as ByteVC2 will not play however often it is retried.
+  if (appError && appError.code === 'UNSUPPORTED_CODEC') throw Object.assign(new Error(appError.message), { appRejected: true });
+  // Upstream 5.7: when the App refused the request, automatic retries (prefetch) stop.
+  const rejected = { appRejected: !!(appError && appError.rejected) };
   if (!inWebRange) {
     const range = accessible > 0 ? '仅提供前 ' + accessible + ' 集' : '暂未提供可播放分集';
-    throw new Error('红果官网当前' + range + '，第 ' + (index + 1) + ' 集暂时无法获取播放地址，请稍后重试。');
+    throw Object.assign(new Error('红果官网当前' + range + '，第 ' + (index + 1) + ' 集暂时无法获取播放地址，请稍后重试。'), rejected);
   }
-  throw new Error('红果官网与备用接口均未提供播放地址，请稍后重试');
+  throw Object.assign(new Error('红果官网与备用接口均未提供播放地址，请稍后重试'), rejected);
 }
 
 // A chosen quality needs the App source: the website gives one stream of unknown size.
@@ -234,6 +238,7 @@ async function fetchPlayInfoAtQuality(vid, quality) {
     return await fetchAppPlayUrl(vid, { quality });
   } catch (error) {
     if (error && error.network) throw new Error('网络连接失败，未能获取播放地址，请检查电视网络后重试');
+    if (error && error.code === 'UNSUPPORTED_CODEC') throw Object.assign(new Error(error.message), { appRejected: true });
     const reason = error && error.quality ? error.message : '备用接口未提供 ' + quality.toUpperCase() + ' 片源，未自动降级';
     throw new Error(reason + '。可在「设置」里把红果清晰度改为「自动」后重试。');
   }

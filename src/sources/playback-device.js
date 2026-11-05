@@ -93,7 +93,8 @@ export async function registerPlaybackDevice(requestJson) {
   const device_id = responseId(response, 'device_id');
   const iid = responseId(response, 'install_id');
   if (!device_id || !iid || Number((response && (response.code != null ? response.code : response.Code)) || 0) !== 0) {
-    throw new Error('App 片源设备注册失败，请稍后重试');
+    // Upstream 5.7: an answer without a usable device is a refusal; retrying soon will not fix it.
+    throw Object.assign(new Error('App 片源设备注册被拒绝，请稍后手动重试（上游何时恢复暂无法确认）'), { rejected: true });
   }
   return Object.freeze({ device_id, iid, cdid });
 }
