@@ -237,7 +237,7 @@ test('a failed registration is shared, then retried after 30 s', async () => {
   });
   const now = Date.now;
   try {
-    await assert.rejects(getPlayInfo('9000000000000000017', '', { force: true }), /均未提供播放地址|设备注册失败/);
+    await assert.rejects(getPlayInfo('9000000000000000017', '', { force: true }), error => /均未提供播放地址/.test(error.message) && error.appRejected === true);
     await assert.rejects(getPlayInfo('9000000000000000018', '', { force: true }));
     assert.equal(registrations, 1);
     const later = now() + 31000;
@@ -386,4 +386,24 @@ test('with every stream skipped the player is told there is no other one', async
     return true;
   });
   assert.equal(requested.filter(u => /qznovelvod/.test(u)).length, 0);
+});
+
+test('an episode offered only as ByteVC2 says the TV cannot play it, even at a chosen quality', async () => {
+  const list = { video_1: { codec_type: 'bytevc2', definition: '1080p', main_url: MEDIA.main1080, vwidth: 1080, vheight: 1920, spade_a: spadeFor(KEY) } };
+  fake({ outer: { code: 0, video_info: { code: 0, data: { video_list: list } } } });
+  await assert.rejects(getPlayInfo('9000000000000000090', '', { force: true }),
+    error => /ByteVC2/.test(error.message) && /官方 App/.test(error.message) && error.appRejected === true);
+  await assert.rejects(getPlayInfo('9000000000000000090', '', { force: true, quality: '1080p' }), /ByteVC2/);
+  // Any H.264/HEVC stream beside it still plays; ByteVC2 is never mistaken for HEVC.
+  list.video_2 = { codec_type: 'bytevc1', definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280, spade_a: spadeFor(KEY) };
+  const info = await getPlayInfo('9000000000000000091', '', { force: true });
+  assert.deepEqual(info.variants.map(v => v.url), [MEDIA.main720]);
+});
+
+test('an App refusal (HTTP 403/429) stops prefetch retries; a timeout does not', async () => {
+  const { prefetch } = await import('../src/media/playback.js');
+  for (const [status, outcome] of [[403, 'rejected'], [429, 'rejected'], [503, 'failed'], [0, 'failed']]) {
+    fake({ api: () => { throw new HttpError(status ? 'HTTP ' + status : '请求超时', status); } });
+    assert.equal(await prefetch('90000000000000001' + (status || '00'), '', null, 'auto'), outcome, String(status));
+  }
 });

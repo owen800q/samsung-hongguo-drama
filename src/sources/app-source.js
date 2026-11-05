@@ -117,7 +117,8 @@ async function requestJson(url, options, deadline) {
   try {
     res = await request(url, Object.assign({}, options, { responseType: 'text', timeout }));
   } catch (error) {
-    if (error && error.status > 0) throw new Error('App 片源请求失败（HTTP ' + error.status + '）');
+    // Upstream 5.7: 403/429 is the App refusing this TV, not a passing outage.
+    if (error && error.status > 0) throw Object.assign(new Error('App 片源请求失败（HTTP ' + error.status + '）'), { rejected: error.status === 403 || error.status === 429 });
     // No response at all: the TV's connection, not the source, is the likely cause.
     throw Object.assign(new Error('App 片源请求失败，请稍后重试'), { network: true });
   }
@@ -141,7 +142,7 @@ function shortEdge(item) {
 }
 
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-function businessRejected() { return new Error('App 接口暂未提供本集播放信息'); }
+function businessRejected() { return Object.assign(new Error('App 接口暂未提供本集播放信息'), { rejected: true }); }
 
 /**
  * `options.quality`: 'auto' (best first) or '720p' / '1080p'. A chosen quality only uses
@@ -233,8 +234,17 @@ function parsePlayModel(info, wanted, requireEncryptionInfo, minimumEdge) {
   if (!rows.length) {
     // Upstream 4.7: only blame the chosen quality when compatible streams exist at other sizes.
     const strict = compatible.length > 0 && wanted !== 'auto';
+    // Upstream 5.6 (#95): some episodes only come as ByteVC2, which no TV decodes. Say so
+    // rather than blame the network (the desktop app 5.7 transcodes it; a TV cannot).
+    const byteVc2 = !strict && Object.keys(list).some(k => {
+      const item = list[k] || {};
+      return str(item.codec_type || (item.video_meta || {}).codec_type).toLowerCase() === 'bytevc2';
+    });
     throw Object.assign(new Error(strict ? '本集暂无可确认为 ' + wanted.toUpperCase() + ' 的片源，未自动降级'
-      : '本集暂未提供兼容的 H.264/HEVC 片源'), { code: strict ? 'QUALITY_UNAVAILABLE' : 'NO_COMPATIBLE_SOURCE', quality: wanted !== 'auto' });
+      : byteVc2 ? '本集仅提供电视不支持的 ByteVC2 编码，暂时无法播放，请在红果官方 App 观看'
+        : '本集暂未提供兼容的 H.264/HEVC 片源'), {
+      code: strict ? 'QUALITY_UNAVAILABLE' : byteVc2 ? 'UNSUPPORTED_CODEC' : 'NO_COMPATIBLE_SOURCE', quality: wanted !== 'auto',
+    });
   }
   // Every usable address, best first: a stream's main address, then its backups, then the
   // next stream. The player falls back along this list when a download fails.

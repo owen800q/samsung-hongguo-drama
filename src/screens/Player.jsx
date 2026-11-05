@@ -247,7 +247,8 @@ export function Player({ series, index: startIndex, fromStart }) {
   // ---------- next-episode cache ----------
   // Starts as soon as playback does, so switching episodes rarely waits on a download.
   // A failed prefetch is let go and tried again from timeupdate after a pause, so one
-  // error does not leave the next episode uncached; a few failures give up on it.
+  // error does not leave the next episode uncached; a few failures, or one refusal by the
+  // App (upstream 5.7), give up on it.
   function warmNext() {
     if (!getSettings().cacheNext || nextRef.current < 0) return;
     const next = episodes[nextRef.current];
@@ -259,8 +260,9 @@ export function Player({ series, index: startIndex, fromStart }) {
     prefetched.current = next.vid;
     prefetchToken.current = token;
     prefetch(next.vid, series.series_id, token, getSettings().hongguoQuality).then(outcome => {
-      if (outcome !== 'failed' || prefetchToken.current !== token) return;
-      prefetchFailures.current[next.vid] = { at: Date.now(), count: (failed ? failed.count : 0) + 1 };
+      if ((outcome !== 'failed' && outcome !== 'rejected') || prefetchToken.current !== token) return;
+      // A refusal from the App is not retried automatically; playing the episode still tries it.
+      prefetchFailures.current[next.vid] = { at: Date.now(), count: outcome === 'rejected' ? PREFETCH_ATTEMPTS : (failed ? failed.count : 0) + 1 };
       prefetchToken.current = null;
       prefetched.current = '';
     });
