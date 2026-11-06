@@ -341,6 +341,27 @@ test('inline streams without encryption info are read from the checked fallback 
   }
 });
 
+// Upstream 5.8 (#102): a fallback model may state `encrypt: false` on the stream itself.
+test('a fallback stream with a top-level plaintext flag plays without a key', async () => {
+  let n = 70;
+  for (const encrypt of [false, 0, '0', 'false']) {
+    const vid = '90000000000000000' + (n++);
+    inlineWithoutKeys(vid, { video_id: 'v0abc', video_duration: 61.2, video_list: {
+      video_1: { codec_type: 'h264', definition: '1080p', main_url: MEDIA.backup1080, vwidth: 1080, vheight: 1920, encrypt, spade_a: '' },
+    } });
+    const info = await getPlayInfo(vid, '', { force: true });
+    assert.equal(info.url, MEDIA.backup1080, JSON.stringify(encrypt));
+    assert.equal(info.contentKey, null, JSON.stringify(encrypt));
+  }
+  for (const encrypt of [true, 1, '1', 'true']) {
+    const vid = '90000000000000000' + (n++);
+    inlineWithoutKeys(vid, { video_id: 'v0abc', video_duration: 61.2, video_list: {
+      video_1: { codec_type: 'h264', definition: '1080p', main_url: MEDIA.backup1080, vwidth: 1080, vheight: 1920, encrypt, spade_a: '' },
+    } });
+    await assert.rejects(getPlayInfo(vid, '', { force: true }), /均未提供播放地址/, JSON.stringify(encrypt));
+  }
+});
+
 test('an inline stream that states an unusable encryption does not ask the fallback model', async () => {
   const requested = inlineWithoutKeys('9000000000000000065', { video_id: 'v0abc', video_duration: 61.2, video_list: videoList() }, {
     video_list: [{ codec_type: 'h264', definition: '1080p', main_url: MEDIA.main1080, vwidth: 1080, vheight: 1920, encrypt_info: { encrypt: true } }],
