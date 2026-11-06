@@ -264,9 +264,12 @@ function parsePlayModel(info, wanted, requireEncryptionInfo, minimumEdge) {
         if (contentKey === undefined) {
           const encryptInfo = selected.item.encrypt_info || {};
           const spade = selected.item.spade_a || encryptInfo.spade_a;
+          // Upstream 5.8 (#102): some fallback models state it on the stream itself
+          // (`encrypt: false`) instead of inside encrypt_info.
+          const encrypt = encryptInfo.encrypt != null ? encryptInfo.encrypt : selected.item.encrypt;
           // An inline stream is encrypted unless it says otherwise: never play it as clear.
-          if (requireEncryptionInfo && !spade && [false, 0, '0', 'false'].indexOf(encryptInfo.encrypt) < 0) {
-            if (encryptInfo.encrypt == null) missingEncryptionInfo = true;
+          if (requireEncryptionInfo && !spade && [false, 0, '0', 'false'].indexOf(encrypt) < 0) {
+            if (encrypt == null) missingEncryptionInfo = true;
             throw new Error('本集片源缺少有效解密信息');
           }
           contentKey = spade ? deriveContentKey(spade) : null;

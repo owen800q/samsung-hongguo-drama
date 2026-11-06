@@ -43,7 +43,9 @@ export function Detail({ series: initial }) {
   // Coming back from the player: the resume button text changes, keep focus on it.
   useEffect(() => { if (active) setHistory(getHistoryEntry(initial.series_id)); }, [active]);
 
-  const view = data || initial;
+  // Upstream 5.8 (#104): the detail lookup may lack a cover or synopsis the search or
+  // catalog result already had; keep those instead of blanking them.
+  const view = data ? Object.assign({}, data, { cover: data.cover || initial.cover || '', intro: data.intro || initial.intro || '' }) : initial;
   const episodes = data ? data.episodes : [];
   const resumeIndex = history ? Math.max(0, episodes.findIndex(ep => String(ep.vid) === String(history.vid))) : 0;
   const resumeEp = episodes[resumeIndex];
@@ -58,7 +60,7 @@ export function Detail({ series: initial }) {
       toast('第 ' + episodes[index].vid_index + ' 集在来源平台需要解锁，暂不能播放', 'warn');
       return;
     }
-    router.push('player', { series: data, index, fromStart: !!fromStart });
+    router.push('player', { series: view, index, fromStart: !!fromStart });
   }
 
   function findSequels() {
@@ -97,7 +99,7 @@ export function Detail({ series: initial }) {
           <div class="detail-eyebrow">{SOURCE_LABEL[view.source || (data && data.source)] || ''}{total ? ' · 全' + total + '集' : ''}</div>
           <h1 class="detail-title">{view.series_title || '加载中…'}</h1>
           {view.tags && view.tags.length > 0 && <div class="detail-tags">{view.tags.slice(0, 5).map(t => <span key={t} class="tag">{t}</span>)}</div>}
-          {(data && data.intro) || initial.intro ? <p class="detail-intro">{(data && data.intro) || initial.intro}</p> : null}
+          {view.intro ? <p class="detail-intro">{view.intro}</p> : null}
           <div class="detail-actions">
             <button type="button" tabIndex={-1} class="btn btn-primary btn-lg focusable" data-autofocus disabled={!data}
               onClick={() => play(resumeIndex)}>

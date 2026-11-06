@@ -702,6 +702,37 @@ try {
     JSON.stringify(Object.assign({ held: held.length, detailPages, ms: Date.now() - hungOpened }, hungState)));
   await Promise.all(held.map(route => route.abort().catch(() => {})));
   await hung.close();
+
+  // Upstream 5.8 (#104): a detail lookup without a cover keeps the poster's cover.
+  const bare = await ctx.newPage();
+  await bare.addInitScript(() => { window.tizen = { tvinputdevice: { registerKey() {} } }; });
+  bare.on('pageerror', e => errors.push('coverless detail page: ' + e));
+  let stripped = 0;
+  await bare.route(/hongguoduanju\.com\/(player\/\d+$|detail\?series_id=\d+)/, async route => {
+    try {
+      const res = await route.fetch();
+      const body = (await res.text()).replace(/(\\?"series_cover\\?"\s*:\s*\\?")(?:[^"\\]|\\u[0-9a-fA-F]{4}|\\\/)*/g, (m, head) => { stripped++; return head; });
+      await route.fulfill({ response: res, body });
+    } catch (_) { await route.abort().catch(() => {}); }
+  });
+  await bare.goto(URL_);
+  await bare.waitForSelector('.poster.focusable img', { timeout: 30000 });
+  const posterCover = await bare.evaluate(() => {
+    const poster = document.querySelector('.poster.focusable');
+    poster.focus();
+    return (poster.querySelector('img') || {}).src || '';
+  });
+  await bare.keyboard.press('Enter');
+  await bare.waitForSelector('.detail .btn-primary:not([disabled])', { timeout: 60000 }).catch(() => {});
+  const bareState = await bare.evaluate(() => ({
+    episodes: document.querySelectorAll('.screen.is-active .episode').length,
+    cover: (document.querySelector('.screen.is-active .detail-cover img') || {}).src || '',
+    focused: (document.activeElement.textContent || '').trim(),
+  }));
+  check('a detail lookup without a cover keeps the poster cover, play button focused',
+    stripped > 0 && bareState.episodes > 0 && !!posterCover && bareState.cover === posterCover && /播放/.test(bareState.focused),
+    JSON.stringify(Object.assign({ stripped, posterCover: posterCover.slice(0, 60) }, bareState, { cover: bareState.cover.slice(0, 60) })));
+  await bare.close();
 } catch (e) {
   check('e2e run completed', false, String(e && e.stack || e));
   await page.screenshot({ path: path.join(os.tmpdir(), 'hgtv-e2e-failure.png') }).catch(() => {});
