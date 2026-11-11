@@ -162,11 +162,13 @@ try {
     let body = await response.text();
     try {
       const json = JSON.parse(body);
-      Object.keys(json.data || {}).forEach(vid => {
-        const entry = json.data[vid];
+      // video_tab nests the models under video_model_data and may key the streams by name.
+      const entries = (json.data && json.data.video_model_data) || json.data || {};
+      Object.keys(entries).forEach(vid => {
+        const entry = entries[vid];
         const model = typeof entry.video_model === 'string' ? JSON.parse(entry.video_model) : entry.video_model;
-        (model && Array.isArray(model.video_list) ? model.video_list : []).forEach(item => {
-          if (typeof item.main_url !== 'string') return;
+        Object.values((model && model.video_list) || {}).forEach(item => {
+          if (!item || typeof item.main_url !== 'string') return;
           item.backup_url_list = [item.main_url].concat(item.backup_url_list || []);
           item.main_url = item.main_url.replace(/(qznovelvod|fqnovelvod|douyinvod)\.com\//, '$1.com/e2e-missing/');
         });
@@ -531,8 +533,8 @@ try {
     const body = await response.text();
     try {
       const json = JSON.parse(body);
-      Object.values(json.data || {}).forEach(entry => {
-        const model = typeof entry.video_model === 'string' ? JSON.parse(entry.video_model) : entry.video_model;
+      Object.values((json.data && json.data.video_model_data) || json.data || {}).forEach(entry => {
+        const model = entry && (typeof entry.video_model === 'string' ? JSON.parse(entry.video_model) : entry.video_model);
         if (model && model.video_list) countStreams(model.video_list);
       });
       if (json.video_info && json.video_info.data) countStreams(json.video_info.data.video_list);

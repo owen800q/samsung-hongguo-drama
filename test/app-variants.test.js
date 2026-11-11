@@ -5,10 +5,21 @@ import { setTransport, HttpError } from '../src/lib/http.js';
 import { getPlayInfo } from '../src/sources/index.js';
 import { resolvePlayback, setPlayMaxBytes } from '../src/media/playback.js';
 import { resetPlaybackDevice } from '../src/sources/playback-device.js';
-import { playbackRequest } from '../src/sources/app-source.js';
+import zlib from 'node:zlib';
+import { createHash } from 'node:crypto';
+import { playbackRequest, fetchAppPlayUrl, setPlaybackPacing } from '../src/sources/app-source.js';
 import { branchOf } from '../src/sources/app-signing.js';
 
 const KEY = '0123456789abcdef0123456789abcdef';
+
+// The one-second pause between lookups has its own test below.
+setPlaybackPacing(0);
+
+/** The episode a playback request asks for: video_tab names it in the query, the POST in its gzip body. */
+function requestedVid(url, options) {
+  return new URL(url).searchParams.get('video_id')
+    || JSON.parse(zlib.gunzipSync(Buffer.from(options.body)).toString()).mixed_video_id_map[1004][0];
+}
 
 // Inverse of deriveContentKey in src/sources/app-source.js.
 function spadeFor(hex) {
@@ -53,9 +64,9 @@ function fake({ outer, api, media = {} } = {}) {
     if (/hongguoduanju\.com/.test(url)) return reply(500, '');
     if (/device_register/.test(url)) return reply(200, JSON.stringify(REGISTERED));
     if (/api5-normal/.test(url)) {
-      if (api) return api(url);
-      const vid = JSON.parse(new TextDecoder().decode(options.body)).mixed_video_id_map[1004][0];
-      return reply(200, JSON.stringify({ code: 0, data: { [vid]: { video_model: JSON.stringify({ fallback_api: 'https://vas.snssdk.com/video/fallback' }) } } }));
+      if (api) return api(url, options);
+      const vid = requestedVid(url, options);
+      return reply(200, JSON.stringify({ code: 0, data: { video_model_data: { [vid]: { video_model: JSON.stringify({ fallback_api: 'https://vas.snssdk.com/video/fallback' }) } } } }));
     }
     if (/vas\.snssdk\.com/.test(url)) return reply(200, JSON.stringify(outer || { code: 0, video_info: { code: 0, data: { video_list: videoList() } } }));
     if (media[url]) return media[url](reply, options);
@@ -180,15 +191,15 @@ test('each app playback lookup registers its own anonymous device and sends it',
   assert.ok(calls.every(q => /^[0-9a-f-]{36}$/.test(q.get('cdid'))));
 });
 
-// Upstream 5.4: unsigned playback requests get empty bodies again.
-test('playback requests are signed over the final query, body and timestamp', async () => {
+// Upstream 5.4: unsigned playback requests get empty bodies again. 6.6: the POST body is
+// gzipped and signed as sent. 6.7: the video_tab GET has no body.
+test('playback requests are signed over the final query, the bytes sent and the timestamp', async () => {
   const identity = { device_id: REGISTERED.device_id_str, iid: REGISTERED.install_id_str, cdid: '00000000-0000-4000-8000-000000000000' };
   const payload = '{"mixed_video_id_map":{"1004":["9000000000000000099"]}}';
-  for (const host of ['api5-normal-sinfonlineb.fqnovel.com', 'api5-normal-hl.fqnovel.com']) {
-    const signed = playbackRequest(payload, identity, host);
+  for (const videoId of ['9000000000000000099', '']) {
+    const signed = playbackRequest(payload, identity, videoId);
     const url = new URL(signed.url);
-    assert.equal(url.hostname, host);
-    assert.equal(url.pathname, '/novel/player/multi_video_model/v1/');
+    assert.equal(url.hostname, 'api5-normal-sinfonlineb.fqnovel.com');
     const khronos = Number(signed.headers['x-khronos']);
     assert.equal(url.searchParams.get('ts'), String(khronos));
     assert.equal(url.searchParams.get('_rticket'), signed.headers['x-ss-req-ticket']);
@@ -199,7 +210,27 @@ test('playback requests are signed over the final query, body and timestamp', as
     assert.equal(Buffer.from(signed.headers['x-argus'], 'base64').readUInt32LE(0), khronos);
     assert.ok(Buffer.from(signed.headers['x-helios'], 'base64').length >= 36);
     assert.ok(Buffer.from(signed.headers['x-medusa'], 'base64').length > 300);
-    assert.equal(new TextDecoder().decode(signed.body), payload);
+    assert.equal(signed.headers['x-ss-dp'], '8662');
+    if (videoId) {
+      assert.equal(signed.method, 'GET');
+      assert.equal(url.pathname, '/reading/bookapi/video_tab/multi_video_model/v1/');
+      assert.equal(signed.body, null);
+      assert.equal(url.searchParams.get('video_id'), videoId);
+      assert.equal(url.searchParams.get('version_name'), '7.3.9.32');
+      assert.equal(url.searchParams.get('from_video_id'), '');
+      assert.equal(signed.headers['x-tt-request-tag'], 't=0;n=0');
+      assert.ok(!('Content-Type' in signed.headers) && !('Content-Encoding' in signed.headers) && !('x-ss-stub' in signed.headers));
+      assert.equal(signed.headers['passport-sdk-version'], '50561');
+    } else {
+      assert.equal(signed.method, 'POST');
+      assert.equal(url.pathname, '/novel/player/multi_video_model/v1/');
+      assert.equal(url.searchParams.get('version_name'), '7.4.3.32');
+      assert.equal(url.searchParams.get('video_id'), null);
+      assert.equal(zlib.gunzipSync(Buffer.from(signed.body)).toString(), payload);
+      assert.equal(signed.headers['Content-Encoding'], 'gzip');
+      assert.equal(signed.headers['x-ss-stub'], createHash('md5').update(signed.body).digest('hex').toUpperCase());
+      assert.equal(signed.headers['passport-sdk-version'], '5051452');
+    }
   }
 });
 
@@ -250,9 +281,9 @@ test('a failed registration is shared, then retried after 30 s', async () => {
   }
 });
 
-// Upstream 5.5: an empty answer gets one more try on the alternate host, with a new device.
+// Upstream 5.5/6.9: an empty video_tab answer gets one try on the older POST, with a new device.
 function renewingTransport({ emptyFor = () => false, failRegistration = () => false } = {}) {
-  const log = { registrations: 0, devices: [], hosts: [] };
+  const log = { registrations: 0, devices: [], paths: [] };
   setTransport(async (url, options) => {
     const reply = (status, data) => ({ status, data, url, header: n => (n === 'content-type' ? 'application/json' : null) });
     if (/hongguoduanju\.com/.test(url)) return reply(500, '');
@@ -264,19 +295,21 @@ function renewingTransport({ emptyFor = () => false, failRegistration = () => fa
     if (/api5-normal/.test(url)) {
       const device = new URL(url).searchParams.get('device_id');
       log.devices.push(device);
-      log.hosts.push(new URL(url).hostname);
+      log.paths.push((options.method || 'GET') + ' ' + new URL(url).pathname);
       if (emptyFor(device)) return reply(200, '');
-      const vid = JSON.parse(new TextDecoder().decode(options.body)).mixed_video_id_map[1004][0];
-      return reply(200, JSON.stringify({ code: 0, data: { [vid]: { video_model: { video_list: [
+      const vid = requestedVid(url, options);
+      const entry = { video_model: { video_list: [
         { codec_type: 'h264', definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } },
-      ] } } } }));
+      ] } };
+      // Each endpoint answers in its own shape.
+      return reply(200, JSON.stringify({ code: 0, data: options.method === 'POST' ? { [vid]: entry } : { video_model_data: { [vid]: entry } } }));
     }
     return reply(404, '');
   });
   return log;
 }
 
-test('an empty playback answer retries once on the alternate host with a new device', async () => {
+test('an empty video_tab answer retries once on the older POST with a new device', async () => {
   resetPlaybackDevice();
   const log = renewingTransport({ emptyFor: device => device === '4200000000000000001' });
   try {
@@ -284,24 +317,24 @@ test('an empty playback answer retries once on the alternate host with a new dev
     assert.equal(info.url, MEDIA.main720);
     assert.equal(log.registrations, 2);
     assert.deepEqual(log.devices, ['4200000000000000001', '4200000000000000002']);
-    assert.deepEqual(log.hosts, ['api5-normal-sinfonlineb.fqnovel.com', 'api5-normal-hl.fqnovel.com']);
+    assert.deepEqual(log.paths, ['GET /reading/bookapi/video_tab/multi_video_model/v1/', 'POST /novel/player/multi_video_model/v1/']);
   } finally {
     resetPlaybackDevice();
   }
 });
 
-test('a lookup tries at most two hosts, and keeps its device when re-registration fails', async () => {
+test('a lookup asks each endpoint at most once, and keeps its device when re-registration fails', async () => {
   resetPlaybackDevice();
   const log = renewingTransport({ emptyFor: () => true });
   await assert.rejects(getPlayInfo('9000000000000000022', '', { force: true }), /均未提供播放地址/);
-  assert.equal(log.devices.length, 2, 'one alternate-host attempt only');
+  assert.equal(log.devices.length, 2, 'one attempt on the older endpoint only');
   resetPlaybackDevice();
 
   const failing = renewingTransport({ emptyFor: device => device === '4200000000000000001', failRegistration: n => n === 2 });
   await assert.rejects(getPlayInfo('9000000000000000026', '', { force: true }), /均未提供播放地址/);
   assert.equal(failing.registrations, 2);
-  assert.deepEqual(failing.devices, ['4200000000000000001', '4200000000000000001'], 'the alternate host still gets the first device');
-  assert.deepEqual(failing.hosts, ['api5-normal-sinfonlineb.fqnovel.com', 'api5-normal-hl.fqnovel.com']);
+  assert.deepEqual(failing.devices, ['4200000000000000001', '4200000000000000001'], 'the older endpoint still gets the first device');
+  assert.deepEqual(failing.paths, ['GET /reading/bookapi/video_tab/multi_video_model/v1/', 'POST /novel/player/multi_video_model/v1/']);
   resetPlaybackDevice();
 });
 
@@ -427,4 +460,62 @@ test('an App refusal (HTTP 403/429) stops prefetch retries; a timeout does not',
     fake({ api: () => { throw new HttpError(status ? 'HTTP ' + status : '请求超时', status); } });
     assert.equal(await prefetch('90000000000000001' + (status || '00'), '', null, 'auto'), outcome, String(status));
   }
+});
+
+// Upstream 6.7: video_tab nests the models and may list the streams as an object.
+test('a video_tab answer is read from video_model_data, for the asked episode only', async () => {
+  const stream = { codec_type: 'h264', definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } };
+  const answer = entries => ({ api: url => ({ status: 200, url, header: () => null, data: JSON.stringify({ code: 0, data: { video_model_data: entries } }) }) });
+  let requested = fake(answer({ '9000000000000000201': { video_model: JSON.stringify({ video_list: { video_1: stream } }) } }));
+  const info = await getPlayInfo('9000000000000000201', '', { force: true });
+  assert.equal(info.url, MEDIA.main720);
+  assert.equal(info.contentKey, KEY);
+  const calls = requested.filter(u => /api5-normal/.test(u));
+  assert.equal(calls.length, 1, 'an answered video_tab request is not followed by the older POST');
+  assert.equal(new URL(calls[0]).searchParams.get('video_id'), '9000000000000000201');
+  // Another episode's model, or a model that is not an object, is not played.
+  requested = fake(answer({ '9000000000000000999': { video_model: { video_list: { video_1: stream } } } }));
+  await assert.rejects(getPlayInfo('9000000000000000202', '', { force: true }), /均未提供播放地址/);
+  fake(answer({ '9000000000000000203': { video_model: [stream] } }));
+  await assert.rejects(getPlayInfo('9000000000000000203', '', { force: true }), /均未提供播放地址/);
+});
+
+// Upstream 6.9 (#138/#139): lookups take turns, a second apart.
+test('app lookups run one at a time with a pause between them', async () => {
+  const stream = { codec_type: 'h264', definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } };
+  const times = [];
+  let active = 0;
+  let overlap = false;
+  fake({ api: async (url, options) => {
+    times.push(Date.now());
+    if (++active > 1) overlap = true;
+    await new Promise(resolve => setTimeout(resolve, 30));
+    active--;
+    return { status: 200, url, header: () => null, data: JSON.stringify({ code: 0, data: { video_model_data: { [requestedVid(url, options)]: { video_model: { video_list: [stream] } } } } }) };
+  } });
+  setPlaybackPacing(200);
+  try {
+    const both = await Promise.all([fetchAppPlayUrl('9000000000000000301'), fetchAppPlayUrl('9000000000000000302')]);
+    assert.deepEqual(both.map(info => info.url), [MEDIA.main720, MEDIA.main720]);
+    assert.equal(overlap, false);
+    assert.ok(times[1] - times[0] >= 220, 'the second lookup waited: ' + (times[1] - times[0]) + ' ms');
+  } finally {
+    setPlaybackPacing(0);
+  }
+});
+
+test('an App refusal also fails the lookups waiting behind it; later ones ask again', async () => {
+  let calls = 0;
+  fake({ api: () => { calls++; throw new HttpError('HTTP 429', 429); } });
+  const results = await Promise.all(['9000000000000000311', '9000000000000000312'].map(vid => fetchAppPlayUrl(vid).then(() => null, error => error)));
+  assert.ok(results.every(error => error && error.rejected === true));
+  assert.equal(calls, 1, 'the waiting lookup was not sent');
+  await assert.rejects(fetchAppPlayUrl('9000000000000000313'));
+  assert.equal(calls, 2);
+  // A passing failure does not stop the queue.
+  setPlaybackPacing(0);
+  calls = 0;
+  fake({ api: () => { calls++; throw new HttpError('HTTP 503', 503); } });
+  await Promise.all(['9000000000000000314', '9000000000000000315'].map(vid => fetchAppPlayUrl(vid).catch(() => null)));
+  assert.equal(calls, 2);
 });
