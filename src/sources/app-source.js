@@ -5,17 +5,18 @@
 // hongguo-drama app. TV changes: Uint8Array instead of Buffer, pure JS hashes, and no
 // User-Agent header (browsers cannot set it). Playback uses a freshly registered anonymous
 // device (playback-device.js, upstream 3.9/5.5) and signed requests (app-signing.js, 5.4).
+// Upstream 6.6-6.9: the video_tab GET is asked first and the older POST (gzip body, signed
+// as sent) only after an empty answer; lookups take turns, one second apart. The video_tab
+// parameters follow tsukiyo-zero/hongguoTV's ContentRepository.tabVideoModel (GPL-3.0-only).
 // SDK protocol constants below are not user credentials.
 import { request } from '../lib/http.js';
 import { getPlaybackDevice } from './playback-device.js';
 import { branchOf, signatureHeaders } from './app-signing.js';
-import { sha512, aes128CbcDecrypt } from '../lib/crypto.js';
-import { utf8, fromUtf8, fromHex, fromBase64, concat } from '../lib/bytes.js';
+import { md5, sha512, aes128CbcDecrypt } from '../lib/crypto.js';
+import { utf8, fromUtf8, toHex, fromHex, fromBase64, concat, gzipStored } from '../lib/bytes.js';
 
-const VIDEO_PATH = '/novel/player/multi_video_model/v1/';
-const VIDEO_HOST = 'api5-normal-sinfonlineb.fqnovel.com';
-// Upstream 5.5: one more attempt on this host after an empty body.
-const ALTERNATE_VIDEO_HOST = 'api5-normal-hl.fqnovel.com';
+const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
+const VIDEO_TAB_API = 'https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/';
 const DEVICE = {
   ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
   version_code: '71332', version_name: '7.1.3.32', device_platform: 'android', os: 'android',
@@ -24,6 +25,12 @@ const DEVICE = {
   update_version_code: '71332', host_abi: 'arm64-v8a', dragon_device_type: 'phone', pv_player: '71332',
   compliance_status: '0', need_personal_recommend: '1', player_so_load: '1', is_android_pad_screen: '0',
 };
+function appVersion(code, name) {
+  return Object.assign({}, DEVICE, { version_code: code, version_name: name, manifest_version_code: code, update_version_code: code, pv_player: code });
+}
+// Upstream 6.6/6.7: each endpoint is asked as the App version it was observed with.
+const PLAYBACK_DEVICE = appVersion('74332', '7.4.3.32');
+const VIDEO_TAB_DEVICE = appVersion('73932', '7.3.9.32');
 
 function str(value, fallback = '') { return String(value == null ? fallback : value).trim(); }
 function cleanUrl(value) { return str(value).replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&'); }
@@ -37,27 +44,37 @@ function pythonUrlEncode(values) {
   }).join('&');
 }
 // Upstream 5.4 signs playback requests again: unsigned ones now get HTTP 200 with an empty
-// body. The signature covers the final query, the POST body and the timestamp, so it is
-// rebuilt for every attempt and host. Like upstream, jitter _rticket until the server would
-// pick signature branch 0.
-export function playbackRequest(payload, identity, host = VIDEO_HOST) {
-  const body = utf8(payload);
+// body. The signature covers the final query, the bytes actually sent and the timestamp, so
+// it is rebuilt for every attempt. Like upstream, jitter _rticket until the server would
+// pick signature branch 0. With `videoId` this is the video_tab GET, which has no body
+// (signed as sixteen zero bytes, not MD5 of nothing); without it, the older POST, whose JSON
+// body is sent gzipped (upstream 6.6).
+export function playbackRequest(payload, identity, videoId) {
+  const body = videoId ? null : gzipStored(utf8(payload));
   const khronos = Math.floor(Date.now() / 1000);
   const ticketBase = Date.now();
-  const device = Object.assign({}, DEVICE, identity);
+  const device = Object.assign({}, videoId ? VIDEO_TAB_DEVICE : PLAYBACK_DEVICE, identity);
+  const values = videoId ? {
+    video_id: videoId, video_id_type: '0', device_level: '1', need_all_video_definition: '1', need_mp4_align: '0',
+    use_os_player: '0', video_platform: '1024', source: '0', from_video_id: '',
+  } : {};
   let url = '';
   let ticket = ticketBase;
   for (let n = 0; ; n++) {
     ticket = ticketBase + n;
-    url = 'https://' + host + VIDEO_PATH + '?' + pythonUrlEncode(Object.assign({}, device, { ts: String(khronos), _rticket: String(ticket) }));
+    url = (videoId ? VIDEO_TAB_API : VIDEO_API) + '?' + pythonUrlEncode(Object.assign({}, device, values, { ts: String(khronos), _rticket: String(ticket) }));
     if (branchOf(url, body, khronos) === 0) break;
     if (n === 127) throw new Error('无法生成播放请求签名');
   }
-  return { url, body, headers: Object.assign({
-    Accept: 'application/json; charset=utf-8,application/x-protobuf', 'Content-Type': 'application/json; charset=UTF-8',
+  const headers = Object.assign({
+    Accept: 'application/json; charset=utf-8,application/x-protobuf',
     'x-ss-req-ticket': String(ticket), 'sdk-version': '2', 'x-xs-from-web': '0', 'x-tt-dt': '',
+    'passport-sdk-version': videoId ? '50561' : '5051452', 'x-ss-dp': String(device.aid),
     'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did',
-  }, signatureHeaders(url, body, khronos, device)) };
+  }, signatureHeaders(url, body, khronos, device));
+  if (body) Object.assign(headers, { 'Content-Type': 'application/json; charset=UTF-8', 'Content-Encoding': 'gzip', 'x-ss-stub': toHex(md5(body)).toUpperCase() });
+  else headers['x-tt-request-tag'] = 't=0;n=0';
+  return { url, body, headers, method: videoId ? 'GET' : 'POST' };
 }
 function parseFallback(value) {
   if (typeof value === 'string') { const parsed = jsonBody(value); return (parsed && parsed.fallback_api) || value; }
@@ -124,7 +141,7 @@ async function requestJson(url, options, deadline) {
   }
   // XHR follows redirects itself; make sure we still ended on an allowed host.
   if (res.url) checkedUrl(res.url, ['fqnovel.com', 'snssdk.com']);
-  if (typeof res.data === 'string' && !res.data.trim()) throw Object.assign(new Error('App 接口返回空响应，可能是设备鉴权问题'), { empty: true });
+  if (typeof res.data === 'string' && !res.data.trim()) throw Object.assign(new Error('App 接口返回空响应（HTTP 200），原因尚未确认'), { empty: true });
   const parsed = typeof res.data === 'string' ? jsonBody(res.data) : res.data;
   if (!parsed || typeof parsed !== 'object') throw new Error('App 接口未返回有效数据');
   return parsed;
@@ -144,14 +161,48 @@ function shortEdge(item) {
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function businessRejected() { return Object.assign(new Error('App 接口暂未提供本集播放信息'), { rejected: true }); }
 
+// Upstream 6.9 (#138/#139): playback and prefetch lookups, registration included, take
+// turns, and the next one starts a second after the last ended, so a burst of requests does
+// not trip the App's limits. A refusal also fails the lookups already waiting behind it.
+let pacingGap = 1000;
+let queue = Promise.resolve();
+let readyAt = 0;
+let lastRefusal = null;
+
+/** Tests only: the pause between lookups, in ms. Also forgets the last refusal. */
+export function setPlaybackPacing(ms) {
+  pacingGap = ms == null ? 1000 : ms;
+  readyAt = 0;
+  lastRefusal = null;
+}
+
 /**
  * `options.quality`: 'auto' (best first) or '720p' / '1080p'. A chosen quality only uses
  * streams whose size confirms it, closest first, and never falls back to a lower one.
  */
-export async function fetchAppPlayUrl(vid, options = {}) {
+export function fetchAppPlayUrl(vid, options = {}) {
   vid = String(vid || '');
+  if (!/^\d{1,30}$/.test(vid)) return Promise.reject(new Error('分集编号无效'));
+  const refusalBefore = lastRefusal;
+  const turn = queue.then(async () => {
+    if (lastRefusal !== refusalBefore) throw lastRefusal;
+    const pause = readyAt - Date.now();
+    if (pause > 0) await wait(pause);
+    try {
+      return await fetchAppPlayUrlFresh(vid, options);
+    } catch (error) {
+      if (error && error.rejected) lastRefusal = error;
+      throw error;
+    } finally {
+      readyAt = Date.now() + pacingGap;
+    }
+  });
+  queue = turn.catch(() => {});
+  return turn;
+}
+
+async function fetchAppPlayUrlFresh(vid, options) {
   const wanted = options.quality === '720p' || options.quality === '1080p' ? options.quality : 'auto';
-  if (!/^\d{1,30}$/.test(vid)) throw new Error('分集编号无效');
   const payload = JSON.stringify({
     biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false, need_all_video_definition: true, need_mp4_align: false, use_os_player: false, use_server_dns: false, video_platform: 1024 },
     mixed_video_id_map: { 1004: [vid] },
@@ -162,24 +213,27 @@ export async function fetchAppPlayUrl(vid, options = {}) {
   const deadline = Date.now() + 12000;
   let response;
   for (let attempt = 0; ; attempt++) {
-    const signed = playbackRequest(payload, identity, attempt ? ALTERNATE_VIDEO_HOST : VIDEO_HOST);
+    // Upstream 6.9: video_tab first; only an empty answer gets one try on the older POST.
+    const signed = playbackRequest(payload, identity, attempt ? '' : vid);
     try {
-      response = await requestJson(signed.url, { method: 'POST', headers: signed.headers, body: signed.body }, deadline);
+      response = await requestJson(signed.url, { method: signed.method, headers: signed.headers, body: signed.body }, deadline);
       break;
     } catch (error) {
-      // An empty body gets one more try on the other host, with a new identity when time allows.
       if (attempt || !error.empty || deadline - Date.now() < 1000) throw error;
+      // With a new identity when time allows; a failed registration keeps the previous one.
       if (deadline - Date.now() >= 8000) {
         try { identity = await getPlaybackDevice(requestJson); } catch (_) { /* keep the previous identity */ }
       }
-      if (deadline - Date.now() < 500) throw error;
-      await wait(300);
+      if (deadline - Date.now() < 1500) throw error;
+      await wait(pacingGap);
     }
   }
   if (Number(response.Code || response.code || 0) !== 0) throw businessRejected();
-  const entry = response.data && response.data[vid];
+  // video_tab nests the models under video_model_data; either way only the asked episode counts.
+  const entries = response.data && (response.data.video_model_data != null ? response.data.video_model_data : response.data);
+  const entry = entries && entries[vid];
   const model = entry && (typeof entry.video_model === 'string' ? jsonBody(entry.video_model) : entry.video_model);
-  if (!model) throw new Error('App 接口未返回所选分集');
+  if (!model || typeof model !== 'object' || Array.isArray(model)) throw new Error('App 接口未返回所选分集');
   const readFallback = async () => {
     const fallback = parseFallback(model.fallback_api);
     if (!fallback) throw new Error('App 接口未返回本集片源地址');
@@ -187,8 +241,9 @@ export async function fetchAppPlayUrl(vid, options = {}) {
     if ([outer, outer.video_info].some(value => Number((value && (value.Code || value.code)) || 0) !== 0)) throw businessRejected();
     return outer.video_info && outer.video_info.data;
   };
-  // The current model lists the streams directly; older ones only point to a fallback_api.
-  const inline = Array.isArray(model.video_list) && model.video_list.length > 0;
+  // The current model lists the streams directly (an array, or an object keyed by stream
+  // from video_tab); older ones only point to a fallback_api.
+  const inline = !!model.video_list && typeof model.video_list === 'object' && Object.keys(model.video_list).length > 0;
   if (!inline) return parsePlayModel(await readFallback(), wanted, false, 0);
   try {
     return parsePlayModel(model, wanted, true, 0);

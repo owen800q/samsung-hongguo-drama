@@ -81,7 +81,7 @@ export function clearVideoType(data, start, end) {
   return type;
 }
 
-function rebuildMoov(data, moovSize, top) {
+function rebuildMoov(data, moovOff, moovSize, top) {
   const moovBox = top.find(b => b.typ === 'moov');
   if (!moovBox) throw new Error('no moov box');
 
@@ -145,21 +145,22 @@ function rebuildMoov(data, moovSize, top) {
 
   const first = serialize(tree);
   const delta = moovSize - first.length;
-  // moov precedes mdat in these files, so shrinking moov shifts every chunk offset.
+  // Shrinking moov only moves what follows it (upstream 6.3): chunks in an mdat placed
+  // before moov keep their offsets.
   for (const b of walkChildren(tree)) {
     if (b.typ === 'stco') {
       const nc = readU32BE(data, b.off + 12);
       for (let i = 0; i < nc; i++) {
         const at = b.off + 16 + i * 4;
         const v = readU32BE(data, at);
-        if (v >= delta) writeU32BE(data, v - delta, at);
+        if (v >= moovOff + moovSize) writeU32BE(data, v - delta, at);
       }
     } else if (b.typ === 'co64') {
       const nc = readU32BE(data, b.off + 12);
       for (let i = 0; i < nc; i++) {
         const at = b.off + 16 + i * 8;
         const v = readU64BE(data, at);
-        if (v >= delta) writeU64BE(data, v - delta, at);
+        if (v >= moovOff + moovSize) writeU64BE(data, v - delta, at);
       }
     }
   }
@@ -251,7 +252,7 @@ export async function decryptMp4(input, key, { onProgress, cancel } = {}) {
     }
   }
 
-  const newMoov = rebuildMoov(data, moov.size, top);
+  const newMoov = rebuildMoov(data, moov.off, moov.size, top);
   const out = [];
   let off = 0;
   while (off < total) {
