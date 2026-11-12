@@ -73,6 +73,9 @@ export async function registerPlaybackDevice(requestJson) {
   };
   const body = registrationBody(header, now);
   let response;
+  // Why it failed (upstream 7.0): only HTTP 403/429 and a business refusal are the App
+  // refusing outright; anything else may pass.
+  let registrationFailure = 'INVALID_RESPONSE';
   try {
     response = await requestJson(REGISTER_URL, {
       method: 'POST',
@@ -88,13 +91,16 @@ export async function registerPlaybackDevice(requestJson) {
   } catch (error) {
     // Keep the "check your network" hint when the TV got no response at all.
     if (error && error.network) throw error;
+    registrationFailure = error && error.status > 0 ? 'HTTP_' + error.status : error && error.empty ? 'EMPTY_RESPONSE' : 'INVALID_RESPONSE';
     response = null;
   }
   const device_id = responseId(response, 'device_id');
   const iid = responseId(response, 'install_id');
-  if (!device_id || !iid || Number((response && (response.code != null ? response.code : response.Code)) || 0) !== 0) {
+  const refused = Number((response && (response.code != null ? response.code : response.Code)) || 0) !== 0;
+  if (!device_id || !iid || refused) {
+    if (refused) registrationFailure = 'BUSINESS_REJECTED';
     // Upstream 5.7: an answer without a usable device is a refusal; retrying soon will not fix it.
-    throw Object.assign(new Error('App 片源设备注册被拒绝，请稍后手动重试（上游何时恢复暂无法确认）'), { rejected: true });
+    throw Object.assign(new Error('App 片源设备注册被拒绝，请稍后手动重试（上游何时恢复暂无法确认）'), { rejected: true, registrationFailure });
   }
   return Object.freeze({ device_id, iid, cdid });
 }
