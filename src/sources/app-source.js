@@ -4,16 +4,17 @@
 // via N3urda/hongguoTV eea73e6a45569a2cbbb9440f7cd5290c459b0b70, and the desktop
 // hongguo-drama app. TV changes: Uint8Array instead of Buffer, pure JS hashes, and no
 // User-Agent header (browsers cannot set it). Playback uses a freshly registered anonymous
-// device (playback-device.js, upstream 3.9/5.5) and signed requests (app-signing.js, 5.4).
+// device (playback-device.js, upstream 3.9/5.5) and signed requests (playback-signature.js,
+// upstream 6.9/7.0; the X-Gorgon family of 5.4 is no longer sent).
 // Upstream 6.6-6.9: the video_tab GET is asked first and the older POST (gzip body, signed
 // as sent) only after an empty answer; lookups take turns, one second apart. The video_tab
 // parameters follow tsukiyo-zero/hongguoTV's ContentRepository.tabVideoModel (GPL-3.0-only).
 // SDK protocol constants below are not user credentials.
 import { request } from '../lib/http.js';
 import { getPlaybackDevice } from './playback-device.js';
-import { branchOf, signatureHeaders } from './app-signing.js';
-import { md5, sha512, aes128CbcDecrypt } from '../lib/crypto.js';
-import { utf8, fromUtf8, toHex, fromHex, fromBase64, concat, gzipStored } from '../lib/bytes.js';
+import { signPlayer } from './playback-signature.js';
+import { sha512, aes128CbcDecrypt } from '../lib/crypto.js';
+import { utf8, fromUtf8, fromHex, fromBase64, concat, gzipStored } from '../lib/bytes.js';
 
 const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
 const VIDEO_TAB_API = 'https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/';
@@ -44,35 +45,31 @@ function pythonUrlEncode(values) {
   }).join('&');
 }
 // Upstream 5.4 signs playback requests again: unsigned ones now get HTTP 200 with an empty
-// body. The signature covers the final query, the bytes actually sent and the timestamp, so
-// it is rebuilt for every attempt. Like upstream, jitter _rticket until the server would
-// pick signature branch 0. With `videoId` this is the video_tab GET, which has no body
-// (signed as sixteen zero bytes, not MD5 of nothing); without it, the older POST, whose JSON
-// body is sent gzipped (upstream 6.6).
+// body. Upstream 6.9/7.0 replaced the older X-Gorgon family here with the App's own 551
+// X-Argus / X-Ladon signature (playback-signature.js). It covers the final query, the bytes
+// actually sent and the timestamp, so it is rebuilt for every attempt. With `videoId` this
+// is the video_tab GET, which has no body; without it, the older POST, whose JSON body is
+// sent gzipped (upstream 6.6).
 export function playbackRequest(payload, identity, videoId) {
   const body = videoId ? null : gzipStored(utf8(payload));
-  const khronos = Math.floor(Date.now() / 1000);
-  const ticketBase = Date.now();
+  const ticket = Date.now();
+  const khronos = Math.floor(ticket / 1000);
   const device = Object.assign({}, videoId ? VIDEO_TAB_DEVICE : PLAYBACK_DEVICE, identity);
   const values = videoId ? {
     video_id: videoId, video_id_type: '0', device_level: '1', need_all_video_definition: '1', need_mp4_align: '0',
     use_os_player: '0', video_platform: '1024', source: '0', from_video_id: '',
   } : {};
-  let url = '';
-  let ticket = ticketBase;
-  for (let n = 0; ; n++) {
-    ticket = ticketBase + n;
-    url = (videoId ? VIDEO_TAB_API : VIDEO_API) + '?' + pythonUrlEncode(Object.assign({}, device, values, { ts: String(khronos), _rticket: String(ticket) }));
-    if (branchOf(url, body, khronos) === 0) break;
-    if (n === 127) throw new Error('无法生成播放请求签名');
-  }
-  const headers = Object.assign({
+  const query = pythonUrlEncode(Object.assign({}, device, values, { ts: String(khronos), _rticket: String(ticket) }));
+  const url = (videoId ? VIDEO_TAB_API : VIDEO_API) + '?' + query;
+  const signature = signPlayer({ query, body, ts: khronos });
+  const headers = {
     Accept: 'application/json; charset=utf-8,application/x-protobuf',
-    'x-ss-req-ticket': String(ticket), 'sdk-version': '2', 'x-xs-from-web': '0', 'x-tt-dt': '',
+    'x-ss-req-ticket': signature['x-ss-req-ticket'], 'sdk-version': '2', 'x-xs-from-web': '0',
     'passport-sdk-version': videoId ? '50561' : '5051452', 'x-ss-dp': String(device.aid),
-    'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did',
-  }, signatureHeaders(url, body, khronos, device));
-  if (body) Object.assign(headers, { 'Content-Type': 'application/json; charset=UTF-8', 'Content-Encoding': 'gzip', 'x-ss-stub': toHex(md5(body)).toUpperCase() });
+    'x-khronos': signature['x-khronos'], 'x-ladon': signature['x-ladon'], 'x-argus': signature['x-argus'],
+    'x-tt-dt': '', 'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did',
+  };
+  if (body) Object.assign(headers, { 'Content-Type': 'application/json; charset=UTF-8', 'Content-Encoding': 'gzip', 'x-ss-stub': signature['x-ss-stub'] });
   else headers['x-tt-request-tag'] = 't=0;n=0';
   return { url, body, headers, method: videoId ? 'GET' : 'POST' };
 }
@@ -220,9 +217,14 @@ async function fetchAppPlayUrlFresh(vid, options) {
       break;
     } catch (error) {
       if (attempt || !error.empty || deadline - Date.now() < 1000) throw error;
-      // With a new identity when time allows; a failed registration keeps the previous one.
+      // With a new identity when time allows. Upstream 7.0: when the App refuses that
+      // registration (HTTP 403/429 or a business refusal), stop here and let the refusal
+      // reach the queue instead of sending the previous identity again. Any other failed
+      // registration (timeout, network, 5xx) keeps the previous identity.
       if (deadline - Date.now() >= 8000) {
-        try { identity = await getPlaybackDevice(requestJson); } catch (_) { /* keep the previous identity */ }
+        try { identity = await getPlaybackDevice(requestJson); } catch (registrationError) {
+          if (registrationError && registrationError.registrationRefused) throw registrationError;
+        }
       }
       if (deadline - Date.now() < 1500) throw error;
       await wait(pacingGap);

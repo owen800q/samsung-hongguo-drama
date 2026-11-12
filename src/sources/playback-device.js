@@ -73,6 +73,9 @@ export async function registerPlaybackDevice(requestJson) {
   };
   const body = registrationBody(header, now);
   let response;
+  // Upstream 7.0: HTTP 403/429 or a business refusal is the App saying no; a timeout, a 5xx
+  // or an unusable answer is not known to be one.
+  let refused = false;
   try {
     response = await requestJson(REGISTER_URL, {
       method: 'POST',
@@ -88,13 +91,17 @@ export async function registerPlaybackDevice(requestJson) {
   } catch (error) {
     // Keep the "check your network" hint when the TV got no response at all.
     if (error && error.network) throw error;
+    refused = !!(error && error.rejected);
     response = null;
   }
   const device_id = responseId(response, 'device_id');
   const iid = responseId(response, 'install_id');
-  if (!device_id || !iid || Number((response && (response.code != null ? response.code : response.Code)) || 0) !== 0) {
+  const businessCode = Number((response && (response.code != null ? response.code : response.Code)) || 0);
+  if (!device_id || !iid || businessCode !== 0) {
     // Upstream 5.7: an answer without a usable device is a refusal; retrying soon will not fix it.
-    throw Object.assign(new Error('App 片源设备注册被拒绝，请稍后手动重试（上游何时恢复暂无法确认）'), { rejected: true });
+    // `registrationRefused` marks the explicit ones, which also end a lookup's recovery (7.0).
+    throw Object.assign(new Error('App 片源设备注册被拒绝，请稍后手动重试（上游何时恢复暂无法确认）'),
+      { rejected: true, registrationRefused: refused || businessCode !== 0 });
   }
   return Object.freeze({ device_id, iid, cdid });
 }

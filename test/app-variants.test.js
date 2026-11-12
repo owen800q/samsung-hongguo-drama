@@ -8,7 +8,7 @@ import { resetPlaybackDevice } from '../src/sources/playback-device.js';
 import zlib from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { playbackRequest, fetchAppPlayUrl, setPlaybackPacing } from '../src/sources/app-source.js';
-import { branchOf } from '../src/sources/app-signing.js';
+import { signPlayer } from '../src/sources/playback-signature.js';
 
 const KEY = '0123456789abcdef0123456789abcdef';
 
@@ -202,14 +202,21 @@ test('playback requests are signed over the final query, the bytes sent and the 
     assert.equal(url.hostname, 'api5-normal-sinfonlineb.fqnovel.com');
     const khronos = Number(signed.headers['x-khronos']);
     assert.equal(url.searchParams.get('ts'), String(khronos));
-    assert.equal(url.searchParams.get('_rticket'), signed.headers['x-ss-req-ticket']);
+    // Upstream 6.9/7.0: the App's own X-Argus / X-Ladon, not the older X-Gorgon family.
+    assert.equal(signed.headers['x-ss-req-ticket'], String(khronos * 1000));
+    const ticket = Number(url.searchParams.get('_rticket'));
+    assert.ok(ticket >= khronos * 1000 && ticket < khronos * 1000 + 1000);
     assert.equal(url.searchParams.get('device_id'), identity.device_id);
-    assert.equal(branchOf(signed.url, signed.body, khronos), 0, 'the request uses signature branch 0');
-    assert.match(signed.headers['x-gorgon'], /^8404[0-9a-f]{4}4001[0-9a-f]{40}$/);
-    assert.equal(Buffer.from(signed.headers['x-ladon'], 'base64').readUInt32BE(0), khronos);
-    assert.equal(Buffer.from(signed.headers['x-argus'], 'base64').readUInt32LE(0), khronos);
-    assert.ok(Buffer.from(signed.headers['x-helios'], 'base64').length >= 36);
-    assert.ok(Buffer.from(signed.headers['x-medusa'], 'base64').length > 300);
+    const argus = Buffer.from(signed.headers['x-argus'], 'base64');
+    assert.equal(argus.subarray(0, 2).toString('hex'), 'f281');
+    assert.equal((argus.length - 2) % 16, 0);
+    const ladon = Buffer.from(signed.headers['x-ladon'], 'base64');
+    assert.equal(ladon.length, 4 + 32);
+    // Same query, body and time with the request's own Ladon randomness: the same header.
+    const again = signPlayer({ query: url.search.slice(1), body: signed.body, ts: khronos, ladonRandom: new Uint8Array(ladon.subarray(0, 4)) });
+    assert.equal(again['x-ladon'], signed.headers['x-ladon']);
+    assert.equal(again['x-ss-stub'], signed.headers['x-ss-stub']);
+    for (const name of ['x-gorgon', 'x-medusa', 'x-helios']) assert.ok(!(name in signed.headers), name);
     assert.equal(signed.headers['x-ss-dp'], '8662');
     if (videoId) {
       assert.equal(signed.method, 'GET');
@@ -228,7 +235,7 @@ test('playback requests are signed over the final query, the bytes sent and the 
       assert.equal(url.searchParams.get('video_id'), null);
       assert.equal(zlib.gunzipSync(Buffer.from(signed.body)).toString(), payload);
       assert.equal(signed.headers['Content-Encoding'], 'gzip');
-      assert.equal(signed.headers['x-ss-stub'], createHash('md5').update(signed.body).digest('hex').toUpperCase());
+      assert.equal(signed.headers['x-ss-stub'], createHash('md5').update(signed.body).digest('hex'));
       assert.equal(signed.headers['passport-sdk-version'], '5051452');
     }
   }
@@ -289,7 +296,8 @@ function renewingTransport({ emptyFor = () => false, failRegistration = () => fa
     if (/hongguoduanju\.com/.test(url)) return reply(500, '');
     if (/device_register/.test(url)) {
       log.registrations++;
-      if (failRegistration(log.registrations)) return reply(200, '{"code":0}');
+      const failed = failRegistration(log.registrations);
+      if (failed) return failed === true ? reply(200, '{"code":0}') : reply(failed.status, failed.data);
       return reply(200, JSON.stringify({ device_id_str: '42000000000000000' + String(log.registrations).padStart(2, '0'), install_id_str: '4300000000000000001' }));
     }
     if (/api5-normal/.test(url)) {
@@ -336,6 +344,40 @@ test('a lookup asks each endpoint at most once, and keeps its device when re-reg
   assert.deepEqual(failing.devices, ['4200000000000000001', '4200000000000000001'], 'the older endpoint still gets the first device');
   assert.deepEqual(failing.paths, ['GET /reading/bookapi/video_tab/multi_video_model/v1/', 'POST /novel/player/multi_video_model/v1/']);
   resetPlaybackDevice();
+});
+
+// Upstream 7.0: the App refusing the new registration ends the lookup; the older endpoint is
+// not asked with the previous device, and the refusal reaches the lookups already waiting.
+for (const [name, failed] of [['HTTP 403', { status: 403, data: '' }], ['HTTP 429', { status: 429, data: '' }],
+  ['a business refusal', { status: 200, data: '{"code":1001,"message":"refused"}' }]]) {
+  test('re-registration refused with ' + name + ' stops the lookup and the ones waiting behind it', async () => {
+    resetPlaybackDevice();
+    setPlaybackPacing(0);
+    const log = renewingTransport({ emptyFor: () => true, failRegistration: n => n === 2 && failed });
+    try {
+      const results = await Promise.all(['9000000000000000401', '9000000000000000402'].map(vid => fetchAppPlayUrl(vid).then(() => null, error => error)));
+      assert.ok(results[0] && results[0].rejected === true && results[0].registrationRefused === true);
+      assert.equal(results[1], results[0], 'the waiting lookup fails with the same refusal');
+      assert.equal(log.registrations, 2, 'the waiting lookup did not register');
+      assert.deepEqual(log.paths, ['GET /reading/bookapi/video_tab/multi_video_model/v1/'], 'the older endpoint was not asked');
+    } finally {
+      resetPlaybackDevice();
+      setPlaybackPacing(0);
+    }
+  });
+}
+
+test('re-registration failing with HTTP 500 still tries the older endpoint with the first device', async () => {
+  resetPlaybackDevice();
+  const log = renewingTransport({ emptyFor: device => device === '4200000000000000001', failRegistration: n => n === 2 && { status: 500, data: '' } });
+  try {
+    const error = await fetchAppPlayUrl('9000000000000000403').then(() => null, e => e);
+    assert.ok(error && error.empty === true && !error.registrationRefused);
+    assert.deepEqual(log.devices, ['4200000000000000001', '4200000000000000001']);
+    assert.deepEqual(log.paths, ['GET /reading/bookapi/video_tab/multi_video_model/v1/', 'POST /novel/player/multi_video_model/v1/']);
+  } finally {
+    resetPlaybackDevice();
+  }
 });
 
 // Upstream 5.5 (PR #92): inline streams with no encryption info may be read from fallback_api.
