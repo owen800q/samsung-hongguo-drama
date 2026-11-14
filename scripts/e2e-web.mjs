@@ -384,9 +384,12 @@ try {
   check('the result head counts title matches', firstOther < 0 || /部标题匹配/.test(grid.head), grid.head);
   const seasonNo = t => { const m = /第([一二三四五六七八九十\d]+)季/.exec(t); return m ? '一二三四五六七八九'.indexOf(m[1]) + 1 || Number(m[1]) : 1; };
   const matches = grid.titles.filter(isMatch);
-  const pick = grid.titles.indexOf(matches.slice().sort((a, b) => seasonNo(a) - seasonNo(b))[0]);
-  const highest = Math.max.apply(null, matches.map(seasonNo));
-  check('season results for a series name include several seasons', matches.length >= 2 && highest > seasonNo(grid.titles[pick]), matches.join(','));
+  // Only the series itself counts as a season: "贞观憨婿：扬名长安城" is another title, not season 1.
+  const isSeason = t => /^贞观憨婿(第[一二三四五六七八九十\d]+季)?$/.test(t.replace(/\s/g, ''));
+  const seasons = matches.filter(isSeason);
+  const pick = grid.titles.indexOf(seasons.slice().sort((a, b) => seasonNo(a) - seasonNo(b))[0]);
+  const highest = Math.max.apply(null, seasons.map(seasonNo));
+  check('season results for a series name include several seasons', seasons.length >= 2 && highest > seasonNo(grid.titles[pick]), matches.join(','));
   await seas.waitForTimeout(400);
   if (!/poster/.test(await seas.evaluate(() => document.activeElement.className))) await press('ArrowDown');
   await press('ArrowDown', Math.floor(pick / 6));
@@ -410,7 +413,7 @@ try {
     fits: Array.from(document.querySelectorAll('.detail-sequels .chip')).every(c => c.getBoundingClientRect().right <= 1920),
   }));
   check('查找下一季 lists only later seasons of the same series, with focus kept on the button',
-    found.chips.length > 0 && found.chips.every(t => isMatch(t) && seasonNo(t) > seasonNo(pickedTitle)) && found.focused === '重新查找' && found.fits,
+    found.chips.length > 0 && found.chips.every(t => isSeason(t) && seasonNo(t) > seasonNo(pickedTitle)) && found.focused === '重新查找' && found.fits,
     JSON.stringify(found).slice(0, 200));
   await press('ArrowDown');
   const chip = await seasFocused();
@@ -500,7 +503,8 @@ try {
     protSrc = await prot.evaluate(() => { const v = document.querySelector('video.player-video'); return v ? v.currentSrc || v.src : ''; });
     if (await prot.$('.player-error')) break;
   }
-  check('a protected preview page falls back to the App source', protPages > 0 && /^blob:/.test(protSrc) && protMedia.length === 0, protSrc + ' protected pages: ' + protPages + ', web hits: ' + protMedia.length);
+  const protError = await prot.evaluate(() => ((document.querySelector('.player-error') || {}).textContent || '').trim());
+  check('a protected preview page falls back to the App source', protPages > 0 && /^blob:/.test(protSrc) && protMedia.length === 0, protSrc + ' protected pages: ' + protPages + ', web hits: ' + protMedia.length + (protError ? ', error: ' + protError.slice(0, 120) : ''));
   await prot.close();
 
   // Upstream 4.8: in auto quality a decrypted App stream the TV cannot decode is swapped for
