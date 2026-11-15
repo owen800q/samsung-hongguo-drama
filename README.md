@@ -76,6 +76,7 @@ npm run package -- --profile <证书配置名>  # 已安装 Tizen CLI 时直接�
 - 目标是 2018 年及以后的三星电视（Tizen 4.0+，Chromium 56+）。打包产物是单个经典 IIFE 脚本，不用 ES module。Tizen 4.0 缺少的方法由 `src/lib/polyfills.js` 补齐，CSS 也避开了 flex `gap`、`aspect-ratio`、`:focus-within` 等 Chromium 56 不支持的写法。
 - 加密分集里有 HEVC 片源，三星电视都能硬件解码。
 - 页面设置了 `no-referrer`：视频 CDN 会拒绝带外部 Referer 的请求。
+- 三个来源返回的播放地址和封面必须指向公网（与桌面版 7.3 一致）：写成回环、局域网、保留地址或 `localhost`、`*.local`、`*.lan` 等本地名称的地址一律不用，这类分集按没有播放地址处理。电视端无法检查域名的解析结果，只按地址本身判断。
 - Tizen 的播放器不能播放 `blob:` 地址的普通 MP4（只支持 MSE），所以解密后的分集会写入应用私有临时目录（`wgt-private-tmp`），用 `file://` 地址播放；为此 config.xml 申请了 filesystem 读写权限。桌面浏览器仍用 blob。
 
 ### 在 Tizen TV 模拟器中验证

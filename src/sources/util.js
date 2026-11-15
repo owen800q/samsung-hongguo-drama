@@ -5,10 +5,50 @@ export function plainText(value) {
   return String(value == null ? '' : value).replace(/<[^>]*>/g, '').trim();
 }
 
+function publicV4(parts) {
+  const a = parts[0], b = parts[1], c = parts[2];
+  return !(a === 0 || a === 10 || a === 127 || a >= 224 || (a === 100 && b >= 64 && b < 128) || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 168) || (a === 192 && b === 0 && (c === 0 || c === 2))
+    || (a === 198 && (b === 18 || b === 19)) || (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113));
+}
+
+/**
+ * Upstream 7.3: every source's media and cover address must point at the public internet.
+ * Loopback, private, link-local, reserved and Fake-IP literals and local names (localhost,
+ * *.local, *.lan, ...) are refused. A TV cannot check what a name resolves to, so this is
+ * the address as written; URL() has already normalised forms such as 0x7f.1 or 2130706433.
+ */
+export function isPublicMediaUrl(value) {
+  try {
+    const url = new URL(value);
+    if (!/^https?:$/.test(url.protocol) || url.username || url.password) return false;
+    const host = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+    if (host.indexOf(':') >= 0) {
+      const mapped = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+      if (mapped) {
+        const hi = parseInt(mapped[1], 16), lo = parseInt(mapped[2], 16);
+        return publicV4([hi >> 8, hi & 255, lo >> 8, lo & 255]);
+      }
+      const dotted = host.match(/^::ffff:(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+      if (dotted) return publicV4(dotted.slice(1).map(Number));
+      const groups = host.split(':');
+      const first = parseInt(groups[0], 16);
+      // Global unicast only (2000::/3), minus documentation, Teredo and 6to4.
+      if (!(first >= 0x2000 && first <= 0x3fff) || first === 0x2002) return false;
+      return !(first === 0x2001 && (groups[1] === 'db8' || groups[1] === '' || groups[1] === '0'));
+    }
+    if (/^[\d.]+$/.test(host)) {
+      const parts = host.split('.').map(Number);
+      return parts.length === 4 && parts.every(n => n >= 0 && n <= 255) && publicV4(parts);
+    }
+    return host.indexOf('.') >= 0 && !/(^|\.)(localhost|local|internal|lan|home)$/.test(host);
+  } catch (_) { return false; }
+}
+
 export function httpsUrl(value) {
   try {
     const url = new URL(value);
-    return url.protocol === 'https:' && !url.username && !url.password ? url.href : '';
+    return url.protocol === 'https:' && !url.username && !url.password && isPublicMediaUrl(url.href) ? url.href : '';
   } catch (_) { return ''; }
 }
 

@@ -383,7 +383,9 @@ try {
     grid.titles.slice(0, 8).join(','));
   check('the result head counts title matches', firstOther < 0 || /部标题匹配/.test(grid.head), grid.head);
   const seasonNo = t => { const m = /第([一二三四五六七八九十\d]+)季/.exec(t); return m ? '一二三四五六七八九'.indexOf(m[1]) + 1 || Number(m[1]) : 1; };
-  const matches = grid.titles.filter(isMatch);
+  // Seasons of this one series: the bare name or the name plus a season number. A spin-off
+  // such as 「贞观憨婿：扬名长安城」 matches the keyword but is another series with no sequel.
+  const matches = grid.titles.filter(t => /^贞观憨婿(第[一二三四五六七八九十\d]+季)?$/.test(t.replace(/\s/g, '')));
   const pick = grid.titles.indexOf(matches.slice().sort((a, b) => seasonNo(a) - seasonNo(b))[0]);
   const highest = Math.max.apply(null, matches.map(seasonNo));
   check('season results for a series name include several seasons', matches.length >= 2 && highest > seasonNo(grid.titles[pick]), matches.join(','));
