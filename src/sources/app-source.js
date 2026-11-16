@@ -190,7 +190,8 @@ export function fetchAppPlayUrl(vid, options = {}) {
       if (error && error.rejected) lastRefusal = error;
       throw error;
     } finally {
-      readyAt = Date.now() + pacingGap;
+      // Upstream 7.3: never move the next start earlier than one already set.
+      readyAt = Math.max(readyAt, Date.now() + pacingGap);
     }
   });
   queue = turn.catch(() => {});

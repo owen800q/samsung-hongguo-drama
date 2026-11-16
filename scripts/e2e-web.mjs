@@ -384,7 +384,10 @@ try {
   check('the result head counts title matches', firstOther < 0 || /部标题匹配/.test(grid.head), grid.head);
   const seasonNo = t => { const m = /第([一二三四五六七八九十\d]+)季/.exec(t); return m ? '一二三四五六七八九'.indexOf(m[1]) + 1 || Number(m[1]) : 1; };
   const matches = grid.titles.filter(isMatch);
-  const pick = grid.titles.indexOf(matches.slice().sort((a, b) => seasonNo(a) - seasonNo(b))[0]);
+  // Only the numbered seasons: a subtitled title of another source ("贞观憨婿：扬名长安城") also
+  // matches the name and counts as season 1, but has no later season in its own source.
+  const numbered = matches.filter(t => /^贞观憨婿(第[一二三四五六七八九十\d]+季)?$/.test(t.replace(/\s/g, '')));
+  const pick = grid.titles.indexOf((numbered.length ? numbered : matches).slice().sort((a, b) => seasonNo(a) - seasonNo(b))[0]);
   const highest = Math.max.apply(null, matches.map(seasonNo));
   check('season results for a series name include several seasons', matches.length >= 2 && highest > seasonNo(grid.titles[pick]), matches.join(','));
   await seas.waitForTimeout(400);
