@@ -6,18 +6,20 @@
 // User-Agent header (browsers cannot set it). Playback uses a freshly registered anonymous
 // device (playback-device.js, upstream 3.9/5.5) and signed requests (playback-signature.js:
 // upstream 6.9 replaced the Gorgon/Medusa/Helios headers with real Argus/Ladon ones).
-// Upstream 6.6-6.9: the video_tab GET is asked first and the older POST (gzip body, signed
-// as sent) only after an empty answer; lookups take turns, one second apart. The video_tab
-// parameters follow tsukiyo-zero/hongguoTV's ContentRepository.tabVideoModel (GPL-3.0-only).
+// Upstream 7.5: the player endpoint, signed with v5 x-helios / x-medusa headers
+// (playback-v5.js), is asked first, then the same request on the other official host, and
+// the older Argus/Ladon POST only after empty answers; the video_tab GET of 6.7-7.4 now
+// answers empty and is gone. Lookups take turns, one second apart (upstream 6.9).
 // SDK protocol constants below are not user credentials.
 import { request } from '../lib/http.js';
 import { getPlaybackDevice } from './playback-device.js';
 import { signPlayer } from './playback-signature.js';
+import { signPlaybackV5 } from './playback-v5.js';
 import { sha512, aes128CbcDecrypt } from '../lib/crypto.js';
 import { utf8, fromUtf8, fromHex, fromBase64, concat, gzipStored } from '../lib/bytes.js';
 
 const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
-const VIDEO_TAB_API = 'https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/';
+const PLAYER_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/player/v1';
 const DEVICE = {
   ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
   version_code: '71332', version_name: '7.1.3.32', device_platform: 'android', os: 'android',
@@ -29,9 +31,14 @@ const DEVICE = {
 function appVersion(code, name) {
   return Object.assign({}, DEVICE, { version_code: code, version_name: name, manifest_version_code: code, update_version_code: code, pv_player: code });
 }
-// Upstream 6.6/6.7: each endpoint is asked as the App version it was observed with.
+// Upstream 6.6: the older POST is asked as the App version it was observed with.
 const PLAYBACK_DEVICE = appVersion('74332', '7.4.3.32');
-const VIDEO_TAB_DEVICE = appVersion('73932', '7.3.9.32');
+// Upstream 7.5: the profile the v5 signature was observed with; it is also written into the
+// signed message, so the query and the signature have to agree on it.
+const PLAYER_PROFILE = {
+  aid: '8662', app_name: 'novelread', version_code: '74332', version_name: '7.4.3.32', channel: 'vivo_8662_64',
+  device_platform: 'android', device_type: 'PGT-AN10', os_version: '12', update_version_code: '74332',
+};
 
 function str(value, fallback = '') { return String(value == null ? fallback : value).trim(); }
 function cleanUrl(value) { return str(value).replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&'); }
@@ -44,32 +51,39 @@ function pythonUrlEncode(values) {
     return encode(key) + '=' + encode(values[key]);
   }).join('&');
 }
-// Unsigned playback requests get HTTP 200 with an empty body (upstream 5.4), and since
-// upstream 6.9 so do ones carrying the older Gorgon/Medusa/Helios headers. The Argus/Ladon
-// signature covers the final query, the bytes actually sent and the timestamp, so it is
-// rebuilt for every attempt. With `videoId` this is the video_tab GET, which has no body;
-// without it, the older POST, whose JSON body is sent gzipped (upstream 6.6).
-export function playbackRequest(payload, identity, videoId) {
-  const body = videoId ? null : gzipStored(utf8(payload));
+// Unsigned playback requests get HTTP 200 with an empty body (upstream 5.4), and so do ones
+// signed the way an earlier App version did. Every signature covers the final query, the
+// bytes actually sent and the timestamp, so it is rebuilt for every attempt. The JSON body
+// is always sent gzipped (upstream 6.6). With `videoId` this is the player endpoint with v5
+// headers (upstream 7.5), on the other official host when `alternate`; without it, the older
+// POST with Argus/Ladon headers (upstream 6.9).
+export function playbackRequest(payload, identity, videoId, alternate) {
+  const body = gzipStored(utf8(payload));
+  if (videoId) {
+    const signed = signPlaybackV5({
+      base: alternate ? PLAYER_API.replace('sinfonlineb.', 'sinfonlinea.') : PLAYER_API,
+      values: Object.assign({}, PLAYER_PROFILE, { iid: identity.iid, cdid: identity.cdid, device_id: identity.device_id }),
+      body, now: Date.now(),
+    });
+    return {
+      url: signed.url, body, method: 'POST',
+      headers: Object.assign({}, signed.headers, { Accept: 'application/json', 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip' }),
+    };
+  }
   const ticket = Date.now();
   const khronos = Math.floor(ticket / 1000);
-  const device = Object.assign({}, videoId ? VIDEO_TAB_DEVICE : PLAYBACK_DEVICE, identity);
-  const values = videoId ? {
-    video_id: videoId, video_id_type: '0', device_level: '1', need_all_video_definition: '1', need_mp4_align: '0',
-    use_os_player: '0', video_platform: '1024', source: '0', from_video_id: '',
-  } : {};
-  const query = pythonUrlEncode(Object.assign({}, device, values, { ts: String(khronos), _rticket: String(ticket) }));
+  const device = Object.assign({}, PLAYBACK_DEVICE, identity);
+  const query = pythonUrlEncode(Object.assign({}, device, { ts: String(khronos), _rticket: String(ticket) }));
   const signature = signPlayer({ query, body, ts: khronos });
   const headers = {
     Accept: 'application/json; charset=utf-8,application/x-protobuf',
     'x-ss-req-ticket': signature['x-ss-req-ticket'], 'sdk-version': '2', 'x-xs-from-web': '0',
-    'passport-sdk-version': videoId ? '50561' : '5051452', 'x-ss-dp': String(device.aid),
+    'passport-sdk-version': '5051452', 'x-ss-dp': String(device.aid),
     'x-khronos': signature['x-khronos'], 'x-ladon': signature['x-ladon'], 'x-argus': signature['x-argus'],
     'x-tt-dt': '', 'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did',
+    'Content-Type': 'application/json; charset=UTF-8', 'Content-Encoding': 'gzip', 'x-ss-stub': signature['x-ss-stub'],
   };
-  if (body) Object.assign(headers, { 'Content-Type': 'application/json; charset=UTF-8', 'Content-Encoding': 'gzip', 'x-ss-stub': signature['x-ss-stub'] });
-  else headers['x-tt-request-tag'] = 't=0;n=0';
-  return { url: (videoId ? VIDEO_TAB_API : VIDEO_API) + '?' + query, body, headers, method: videoId ? 'GET' : 'POST' };
+  return { url: VIDEO_API + '?' + query, body, headers, method: 'POST' };
 }
 function parseFallback(value) {
   if (typeof value === 'string') { const parsed = jsonBody(value); return (parsed && parsed.fallback_api) || value; }
@@ -190,7 +204,7 @@ export function fetchAppPlayUrl(vid, options = {}) {
       if (error && error.rejected) lastRefusal = error;
       throw error;
     } finally {
-      readyAt = Date.now() + pacingGap;
+      readyAt = Math.max(readyAt, Date.now() + pacingGap);
     }
   });
   queue = turn.catch(() => {});
@@ -200,8 +214,9 @@ export function fetchAppPlayUrl(vid, options = {}) {
 async function fetchAppPlayUrlFresh(vid, options) {
   const wanted = options.quality === '720p' || options.quality === '1080p' ? options.quality : 'auto';
   const payload = JSON.stringify({
-    biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false, need_all_video_definition: true, need_mp4_align: false, use_os_player: false, use_server_dns: false, video_platform: 1024 },
+    biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false, disable_video_relate_book: false, need_all_video_definition: true, need_mp4_align: false, use_os_player: false, use_server_dns: false, video_platform: 1024 },
     mixed_video_id_map: { 1004: [vid] },
+    dr_scene: 'player',
   });
   // Upstream 5.5: a registered identity may only be good for one playback request, so each
   // lookup registers its own. Registration has its own 8 s budget, outside the 12 s below.
@@ -209,10 +224,17 @@ async function fetchAppPlayUrlFresh(vid, options) {
   const deadline = Date.now() + 12000;
   let response;
   for (let attempt = 0; ; attempt++) {
-    // Upstream 6.9: video_tab first; only an empty answer gets one try on the older POST.
+    // Upstream 7.5: the player endpoint first; only an empty answer gets one try on the older POST.
     const signed = playbackRequest(payload, identity, attempt ? '' : vid);
     try {
-      response = await requestJson(signed.url, { method: signed.method, headers: signed.headers, body: signed.body }, deadline);
+      try {
+        response = await requestJson(signed.url, { method: signed.method, headers: signed.headers, body: signed.body }, deadline);
+      } catch (error) {
+        if (attempt || !error.empty || deadline - Date.now() < 1000) throw error;
+        // An empty answer may still be answered by the other official host, same identity.
+        const alternate = playbackRequest(payload, identity, vid, true);
+        response = await requestJson(alternate.url, { method: alternate.method, headers: alternate.headers, body: alternate.body }, deadline);
+      }
       break;
     } catch (error) {
       if (attempt || !error.empty || deadline - Date.now() < 1000) throw error;
@@ -230,8 +252,10 @@ async function fetchAppPlayUrlFresh(vid, options) {
     }
   }
   if (Number(response.Code || response.code || 0) !== 0) throw businessRejected();
-  // video_tab nests the models under video_model_data; either way only the asked episode counts.
-  const entries = response.data && (response.data.video_model_data != null ? response.data.video_model_data : response.data);
+  // The player endpoint nests the models under "1004" (older answers under video_model_data
+  // or not at all); either way only the asked episode counts.
+  const entries = response.data && (response.data['1004'] != null ? response.data['1004']
+    : response.data.video_model_data != null ? response.data.video_model_data : response.data);
   const entry = entries && entries[vid];
   const model = entry && (typeof entry.video_model === 'string' ? jsonBody(entry.video_model) : entry.video_model);
   if (!model || typeof model !== 'object' || Array.isArray(model)) throw new Error('App 接口未返回所选分集');
@@ -242,8 +266,8 @@ async function fetchAppPlayUrlFresh(vid, options) {
     if ([outer, outer.video_info].some(value => Number((value && (value.Code || value.code)) || 0) !== 0)) throw businessRejected();
     return outer.video_info && outer.video_info.data;
   };
-  // The current model lists the streams directly (an array, or an object keyed by stream
-  // from video_tab); older ones only point to a fallback_api.
+  // The current model lists the streams directly (an array, or an object keyed by stream);
+  // older ones only point to a fallback_api.
   const inline = !!model.video_list && typeof model.video_list === 'object' && Object.keys(model.video_list).length > 0;
   if (!inline) return parsePlayModel(await readFallback(), wanted, false, 0);
   try {

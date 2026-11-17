@@ -15,10 +15,9 @@ const KEY = '0123456789abcdef0123456789abcdef';
 // The one-second pause between lookups has its own test below.
 setPlaybackPacing(0);
 
-/** The episode a playback request asks for: video_tab names it in the query, the POST in its gzip body. */
+/** The episode a playback request asks for, from its gzip body. */
 function requestedVid(url, options) {
-  return new URL(url).searchParams.get('video_id')
-    || JSON.parse(zlib.gunzipSync(Buffer.from(options.body)).toString()).mixed_video_id_map[1004][0];
+  return JSON.parse(zlib.gunzipSync(Buffer.from(options.body)).toString()).mixed_video_id_map[1004][0];
 }
 
 // Inverse of deriveContentKey in src/sources/app-source.js.
@@ -192,8 +191,8 @@ test('each app playback lookup registers its own anonymous device and sends it',
 });
 
 // Upstream 5.4: unsigned playback requests get empty bodies again. 6.6: the POST body is
-// gzipped and signed as sent. 6.7: the video_tab GET has no body. 6.9: Argus/Ladon headers
-// replace Gorgon/Medusa/Helios.
+// gzipped and signed as sent. 6.9: Argus/Ladon headers on the older POST. 7.5: the player
+// endpoint carries v5 x-helios / x-medusa headers instead.
 test('playback requests are signed over the final query, the bytes sent and the timestamp', async () => {
   const identity = { device_id: REGISTERED.device_id_str, iid: REGISTERED.install_id_str, cdid: '00000000-0000-4000-8000-000000000000' };
   const payload = '{"mixed_video_id_map":{"1004":["9000000000000000099"]}}';
@@ -202,40 +201,48 @@ test('playback requests are signed over the final query, the bytes sent and the 
     const url = new URL(signed.url);
     assert.equal(url.hostname, 'api5-normal-sinfonlineb.fqnovel.com');
     const khronos = Number(signed.headers['x-khronos']);
-    assert.equal(url.searchParams.get('ts'), String(khronos));
-    assert.equal(signed.headers['x-ss-req-ticket'], String(khronos * 1000));
-    const ticket = Number(url.searchParams.get('_rticket'));
-    assert.ok(ticket >= khronos * 1000 && ticket < khronos * 1000 + 1000);
     assert.equal(url.searchParams.get('device_id'), identity.device_id);
-    for (const name of ['x-gorgon', 'x-medusa', 'x-helios']) assert.ok(!(name in signed.headers), name);
-    // Ladon starts with its four random bytes; Argus is checked by decoding nothing, only by
-    // re-signing: the same query, body and time with another body or query must differ.
-    const ladon = Buffer.from(signed.headers['x-ladon'], 'base64');
-    assert.equal(ladon.length, 36);
-    const again = signPlayer({ query: url.search.slice(1), body: signed.body, ts: khronos, randField: 1, ladonRandom: ladon.subarray(0, 4) });
-    assert.equal(again['x-ladon'], signed.headers['x-ladon'], 'Ladon covers the aid in the final query and the time');
-    assert.equal(again['x-ss-stub'], signed.headers['x-ss-stub']);
-    assert.equal(Buffer.from(signed.headers['x-argus'], 'base64').length, Buffer.from(again['x-argus'], 'base64').length);
-    assert.notEqual(again['x-argus'], signPlayer({ query: url.search.slice(1) + '&x=1', body: signed.body, ts: khronos, randField: 1, ladonRandom: ladon.subarray(0, 4) })['x-argus']);
-    assert.equal(signed.headers['x-ss-dp'], '8662');
+    assert.equal(url.searchParams.get('iid'), identity.iid);
+    assert.equal(url.searchParams.get('cdid'), identity.cdid);
+    assert.equal(signed.method, 'POST');
+    assert.equal(zlib.gunzipSync(Buffer.from(signed.body)).toString(), payload);
+    assert.equal(signed.headers['Content-Encoding'], 'gzip');
+    assert.equal(signed.headers['x-ss-stub'].toLowerCase(), createHash('md5').update(signed.body).digest('hex'), 'MD5 of the gzip bytes sent, not of the JSON');
+    assert.ok(!('x-gorgon' in signed.headers));
     if (videoId) {
-      assert.equal(signed.method, 'GET');
-      assert.equal(url.pathname, '/reading/bookapi/video_tab/multi_video_model/v1/');
-      assert.equal(signed.body, null);
-      assert.equal(url.searchParams.get('video_id'), videoId);
-      assert.equal(url.searchParams.get('version_name'), '7.3.9.32');
-      assert.equal(url.searchParams.get('from_video_id'), '');
-      assert.equal(signed.headers['x-tt-request-tag'], 't=0;n=0');
-      assert.ok(!('Content-Type' in signed.headers) && !('Content-Encoding' in signed.headers) && !('x-ss-stub' in signed.headers));
-      assert.equal(signed.headers['passport-sdk-version'], '50561');
+      assert.equal(url.pathname, '/novel/player/multi_video_model/player/v1');
+      assert.deepEqual(Array.from(url.searchParams.keys()), ['aid', 'app_name', 'version_code', 'version_name', 'channel',
+        'device_platform', 'device_type', 'os_version', 'update_version_code', 'iid', 'cdid', 'device_id', '_rticket']);
+      assert.equal(url.searchParams.get('version_name'), '7.4.3.32');
+      assert.equal(url.searchParams.get('channel'), 'vivo_8662_64');
+      const ticket = Number(url.searchParams.get('_rticket'));
+      assert.ok(ticket >= khronos * 1000 && ticket < khronos * 1000 + 2024, 'the ticket is searched from the signing time');
+      assert.equal(signed.headers['x-ss-req-ticket'], String(ticket));
+      assert.deepEqual(Object.keys(signed.headers).sort(), ['Accept', 'Content-Encoding', 'Content-Type', 'x-helios', 'x-khronos', 'x-medusa', 'x-ss-req-ticket', 'x-ss-stub']);
+      const prefix = Buffer.from(signed.headers['x-medusa'], 'base64').subarray(0, 4);
+      assert.equal((prefix.readUInt32LE() ^ khronos) >>> 0, 5, 'a v5 envelope');
+      const other = new URL(playbackRequest(payload, identity, videoId, true).url);
+      assert.equal(other.hostname, 'api5-normal-sinfonlinea.fqnovel.com');
+      assert.equal(other.pathname, url.pathname);
     } else {
-      assert.equal(signed.method, 'POST');
+      for (const name of ['x-medusa', 'x-helios']) assert.ok(!(name in signed.headers), name);
+      assert.equal(url.searchParams.get('ts'), String(khronos));
+      assert.equal(signed.headers['x-ss-req-ticket'], String(khronos * 1000));
+      const ticket = Number(url.searchParams.get('_rticket'));
+      assert.ok(ticket >= khronos * 1000 && ticket < khronos * 1000 + 1000);
+      // Ladon starts with its four random bytes; Argus is checked by decoding nothing, only by
+      // re-signing: the same query, body and time with another body or query must differ.
+      const ladon = Buffer.from(signed.headers['x-ladon'], 'base64');
+      assert.equal(ladon.length, 36);
+      const again = signPlayer({ query: url.search.slice(1), body: signed.body, ts: khronos, randField: 1, ladonRandom: ladon.subarray(0, 4) });
+      assert.equal(again['x-ladon'], signed.headers['x-ladon'], 'Ladon covers the aid in the final query and the time');
+      assert.equal(again['x-ss-stub'], signed.headers['x-ss-stub']);
+      assert.equal(Buffer.from(signed.headers['x-argus'], 'base64').length, Buffer.from(again['x-argus'], 'base64').length);
+      assert.notEqual(again['x-argus'], signPlayer({ query: url.search.slice(1) + '&x=1', body: signed.body, ts: khronos, randField: 1, ladonRandom: ladon.subarray(0, 4) })['x-argus']);
+      assert.equal(signed.headers['x-ss-dp'], '8662');
       assert.equal(url.pathname, '/novel/player/multi_video_model/v1/');
       assert.equal(url.searchParams.get('version_name'), '7.4.3.32');
-      assert.equal(url.searchParams.get('video_id'), null);
-      assert.equal(zlib.gunzipSync(Buffer.from(signed.body)).toString(), payload);
-      assert.equal(signed.headers['Content-Encoding'], 'gzip');
-      assert.equal(signed.headers['x-ss-stub'], createHash('md5').update(signed.body).digest('hex'), 'MD5 of the gzip bytes sent, not of the JSON');
+      assert.equal(signed.headers['x-ss-stub'], createHash('md5').update(signed.body).digest('hex'));
       assert.equal(signed.headers['passport-sdk-version'], '5051452');
     }
   }
@@ -288,9 +295,10 @@ test('a failed registration is shared, then retried after 30 s', async () => {
   }
 });
 
-// Upstream 5.5/6.9: an empty video_tab answer gets one try on the older POST, with a new device.
+// Upstream 5.5/6.9/7.5: an empty answer from the player endpoint is asked again on the other
+// official host with the same device, and then gets one try on the older POST with a new one.
 function renewingTransport({ emptyFor = () => false, failRegistration = () => false, registrationReply } = {}) {
-  const log = { registrations: 0, devices: [], paths: [] };
+  const log = { registrations: 0, devices: [], paths: [], hosts: [] };
   setTransport(async (url, options) => {
     const reply = (status, data) => ({ status, data, url, header: n => (n === 'content-type' ? 'application/json' : null) });
     if (/hongguoduanju\.com/.test(url)) return reply(500, '');
@@ -305,28 +313,30 @@ function renewingTransport({ emptyFor = () => false, failRegistration = () => fa
       const device = new URL(url).searchParams.get('device_id');
       log.devices.push(device);
       log.paths.push((options.method || 'GET') + ' ' + new URL(url).pathname);
+      log.hosts.push(new URL(url).hostname.split('.')[0].slice(-1));
       if (emptyFor(device)) return reply(200, '');
       const vid = requestedVid(url, options);
       const entry = { video_model: { video_list: [
         { codec_type: 'h264', definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } },
       ] } };
       // Each endpoint answers in its own shape.
-      return reply(200, JSON.stringify({ code: 0, data: options.method === 'POST' ? { [vid]: entry } : { video_model_data: { [vid]: entry } } }));
+      return reply(200, JSON.stringify({ code: 0, data: /player\/v1$/.test(new URL(url).pathname) ? { 1004: { [vid]: entry } } : { [vid]: entry } }));
     }
     return reply(404, '');
   });
   return log;
 }
 
-test('an empty video_tab answer retries once on the older POST with a new device', async () => {
+test('an empty player answer is asked on the other host, then once on the older POST with a new device', async () => {
   resetPlaybackDevice();
   const log = renewingTransport({ emptyFor: device => device === '4200000000000000001' });
   try {
     const info = await getPlayInfo('9000000000000000020', '', { force: true });
     assert.equal(info.url, MEDIA.main720);
     assert.equal(log.registrations, 2);
-    assert.deepEqual(log.devices, ['4200000000000000001', '4200000000000000002']);
-    assert.deepEqual(log.paths, ['GET /reading/bookapi/video_tab/multi_video_model/v1/', 'POST /novel/player/multi_video_model/v1/']);
+    assert.deepEqual(log.devices, ['4200000000000000001', '4200000000000000001', '4200000000000000002']);
+    assert.deepEqual(log.paths, ['POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/v1/']);
+    assert.deepEqual(log.hosts, ['b', 'a', 'b']);
   } finally {
     resetPlaybackDevice();
   }
@@ -336,14 +346,14 @@ test('a lookup asks each endpoint at most once, and keeps its device when re-reg
   resetPlaybackDevice();
   const log = renewingTransport({ emptyFor: () => true });
   await assert.rejects(getPlayInfo('9000000000000000022', '', { force: true }), /均未提供播放地址/);
-  assert.equal(log.devices.length, 2, 'one attempt on the older endpoint only');
+  assert.equal(log.devices.length, 3, 'both hosts of the player endpoint, then one attempt on the older endpoint only');
   resetPlaybackDevice();
 
   const failing = renewingTransport({ emptyFor: device => device === '4200000000000000001', failRegistration: n => n === 2 });
   await assert.rejects(getPlayInfo('9000000000000000026', '', { force: true }), /均未提供播放地址/);
   assert.equal(failing.registrations, 2);
-  assert.deepEqual(failing.devices, ['4200000000000000001', '4200000000000000001'], 'the older endpoint still gets the first device');
-  assert.deepEqual(failing.paths, ['GET /reading/bookapi/video_tab/multi_video_model/v1/', 'POST /novel/player/multi_video_model/v1/']);
+  assert.deepEqual(failing.devices, ['4200000000000000001', '4200000000000000001', '4200000000000000001'], 'the older endpoint still gets the first device');
+  assert.deepEqual(failing.paths, ['POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/v1/']);
   resetPlaybackDevice();
 });
 
@@ -362,7 +372,7 @@ test('a refused re-registration stops the lookup and the ones queued behind it',
     assert.match(failed.message, /设备注册被拒绝/);
     assert.equal((await queued).error, failed, 'the queued lookup fails with the same refusal');
     assert.equal(log.registrations, 2, 'nothing registers after the refusal');
-    assert.deepEqual(log.paths, ['GET /reading/bookapi/video_tab/multi_video_model/v1/'], 'the older endpoint is not asked with the previous device');
+    assert.deepEqual(log.paths, ['POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/player/v1'], 'the older endpoint is not asked with the previous device');
   }
   resetPlaybackDevice();
   setPlaybackPacing(0);
@@ -373,12 +383,12 @@ test('a re-registration that fails for a passing reason keeps the one try on the
   for (const failure of passing) {
     resetPlaybackDevice();
     setPlaybackPacing(0);
-    const log = renewingTransport({ emptyFor: device => device === '4200000000000000001' && log.paths.length < 2, registrationReply: n => (n === 2 ? failure : null) });
+    const log = renewingTransport({ emptyFor: device => device === '4200000000000000001' && log.paths.length < 3, registrationReply: n => (n === 2 ? failure : null) });
     const info = await fetchAppPlayUrl('9000000000000000042');
     assert.equal(info.url, MEDIA.main720);
     assert.equal(log.registrations, 2);
-    assert.deepEqual(log.devices, ['4200000000000000001', '4200000000000000001']);
-    assert.deepEqual(log.paths, ['GET /reading/bookapi/video_tab/multi_video_model/v1/', 'POST /novel/player/multi_video_model/v1/']);
+    assert.deepEqual(log.devices, ['4200000000000000001', '4200000000000000001', '4200000000000000001']);
+    assert.deepEqual(log.paths, ['POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/v1/']);
   }
   resetPlaybackDevice();
   setPlaybackPacing(0);
@@ -508,17 +518,22 @@ test('an App refusal (HTTP 403/429) stops prefetch retries; a timeout does not',
   }
 });
 
-// Upstream 6.7: video_tab nests the models and may list the streams as an object.
-test('a video_tab answer is read from video_model_data, for the asked episode only', async () => {
+// Upstream 7.5: the player endpoint nests the models under "1004"; 6.7: an answer may nest
+// them under video_model_data and list the streams as an object.
+test('a nested answer is read for the asked episode only', async () => {
   const stream = { codec_type: 'h264', definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } };
-  const answer = entries => ({ api: url => ({ status: 200, url, header: () => null, data: JSON.stringify({ code: 0, data: { video_model_data: entries } }) }) });
+  let nest = 'video_model_data';
+  const answer = entries => ({ api: url => ({ status: 200, url, header: () => null, data: JSON.stringify({ code: 0, data: { [nest]: entries } }) }) });
   let requested = fake(answer({ '9000000000000000201': { video_model: JSON.stringify({ video_list: { video_1: stream } }) } }));
   const info = await getPlayInfo('9000000000000000201', '', { force: true });
   assert.equal(info.url, MEDIA.main720);
   assert.equal(info.contentKey, KEY);
   const calls = requested.filter(u => /api5-normal/.test(u));
-  assert.equal(calls.length, 1, 'an answered video_tab request is not followed by the older POST');
-  assert.equal(new URL(calls[0]).searchParams.get('video_id'), '9000000000000000201');
+  assert.equal(calls.length, 1, 'an answered request is not followed by the other host or the older POST');
+  assert.equal(new URL(calls[0]).pathname, '/novel/player/multi_video_model/player/v1');
+  nest = '1004';
+  fake(answer({ '9000000000000000204': { video_model: { video_list: [stream] } } }));
+  assert.equal((await getPlayInfo('9000000000000000204', '', { force: true })).url, MEDIA.main720);
   // Another episode's model, or a model that is not an object, is not played.
   requested = fake(answer({ '9000000000000000999': { video_model: { video_list: { video_1: stream } } } }));
   await assert.rejects(getPlayInfo('9000000000000000202', '', { force: true }), /均未提供播放地址/);
