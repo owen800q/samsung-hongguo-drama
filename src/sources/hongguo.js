@@ -1,7 +1,7 @@
 // 红果 via the official website (hongguoduanju.com). Player pages are server-rendered
 // and embed the full episode vid list plus clear MP4 links for the web-accessible range.
 import { CancelToken, getJson, getText, request, memo, withQuery } from '../lib/http.js';
-import { decodeHtml, httpsUrl, readRouterData, uniqueBy } from './util.js';
+import { decodeHtml, httpsUrl, isPublicMediaUrl, readRouterData, uniqueBy } from './util.js';
 import { fetchAppPlayUrl } from './app-source.js';
 
 const SITE = 'https://hongguoduanju.com';
@@ -169,7 +169,7 @@ export function pickWebMedia(html, vid, sid) {
 function mediaUrl(value) {
   try {
     const url = new URL(value);
-    return /^https?:$/.test(url.protocol) && !url.username && !url.password ? url.href : '';
+    return /^https?:$/.test(url.protocol) && !url.username && !url.password && isPublicMediaUrl(url.href) ? url.href : '';
   } catch (_) { return ''; }
 }
 

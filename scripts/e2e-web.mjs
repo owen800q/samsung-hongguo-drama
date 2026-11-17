@@ -162,8 +162,8 @@ try {
     let body = await response.text();
     try {
       const json = JSON.parse(body);
-      // video_tab nests the models under video_model_data and may key the streams by name.
-      const entries = (json.data && json.data.video_model_data) || json.data || {};
+      // The player endpoint nests the models under "1004" and may key the streams by name.
+      const entries = (json.data && (json.data['1004'] || json.data.video_model_data)) || json.data || {};
       Object.keys(entries).forEach(vid => {
         const entry = entries[vid];
         const model = typeof entry.video_model === 'string' ? JSON.parse(entry.video_model) : entry.video_model;
@@ -537,7 +537,7 @@ try {
     const body = await response.text();
     try {
       const json = JSON.parse(body);
-      Object.values((json.data && json.data.video_model_data) || json.data || {}).forEach(entry => {
+      Object.values((json.data && (json.data['1004'] || json.data.video_model_data)) || json.data || {}).forEach(entry => {
         const model = entry && (typeof entry.video_model === 'string' ? JSON.parse(entry.video_model) : entry.video_model);
         if (model && model.video_list) countStreams(model.video_list);
       });

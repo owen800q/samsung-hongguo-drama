@@ -5,10 +5,46 @@ export function plainText(value) {
   return String(value == null ? '' : value).replace(/<[^>]*>/g, '').trim();
 }
 
+// Reserved, private, loopback, link-local, documentation and multicast IPv4 ranges.
+const PRIVATE_V4 = [[0, 0, 8], [10, 0, 8], [100, 64, 10], [127, 0, 8], [169, 254, 16], [172, 16, 12], [192, 0, 24, 0],
+  [192, 0, 24, 2], [192, 168, 16], [198, 18, 15], [198, 51, 24, 100], [203, 0, 24, 113], [224, 0, 3]];
+
+/**
+ * Upstream 7.3: an address a source hands out for a cover or a video has to point at the
+ * public internet, not at this TV or the home network around it. Only the address as
+ * written is judged (a TV app cannot see what a name resolves to).
+ */
+export function isPublicMediaUrl(value) {
+  try {
+    const url = new URL(value);
+    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password) return false;
+    const host = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+    if (host.indexOf(':') >= 0) {
+      // IPv6: global unicast only, without the documentation, Teredo and 6to4 ranges.
+      const first = parseInt(host.split(':')[0] || '0', 16);
+      const second = parseInt(host.split(':')[1] || '0', 16);
+      return first >= 0x2000 && first <= 0x3fff && first !== 0x2002 && !(first === 0x2001 && (second === 0 || second === 0xdb8));
+    }
+    const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+    if (v4) {
+      const n = v4.slice(1).map(Number);
+      if (n.some(part => part > 255)) return false;
+      const address = ((n[0] << 24) | (n[1] << 16) | (n[2] << 8) | n[3]) >>> 0;
+      return !PRIVATE_V4.some(range => {
+        const base = ((range[0] << 24) | (range[1] << 16) | ((range[3] || 0) << 8)) >>> 0;
+        return (address >>> (32 - range[2])) === (base >>> (32 - range[2]));
+      });
+    }
+    // A number that is not a dotted quad is still an address to the TV (e.g. 2130706433).
+    if (/^[\d.]+$/.test(host) || /^0x[0-9a-f]+$/.test(host)) return false;
+    return host.indexOf('.') >= 0 && !/(^|\.)(localhost|local|internal|lan|home)$/.test(host);
+  } catch (_) { return false; }
+}
+
 export function httpsUrl(value) {
   try {
     const url = new URL(value);
-    return url.protocol === 'https:' && !url.username && !url.password ? url.href : '';
+    return url.protocol === 'https:' && !url.username && !url.password && isPublicMediaUrl(url.href) ? url.href : '';
   } catch (_) { return ''; }
 }
 
