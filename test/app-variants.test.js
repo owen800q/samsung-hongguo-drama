@@ -7,7 +7,7 @@ import { resolvePlayback, setPlayMaxBytes } from '../src/media/playback.js';
 import { resetPlaybackDevice } from '../src/sources/playback-device.js';
 import zlib from 'node:zlib';
 import { createHash } from 'node:crypto';
-import { playbackRequest, fetchAppPlayUrl, setPlaybackPacing } from '../src/sources/app-source.js';
+import { playbackRequest, videoTabRequest, fetchAppPlayUrl, setPlaybackPacing } from '../src/sources/app-source.js';
 import { signPlayer } from '../src/sources/playback-signature.js';
 
 const KEY = '0123456789abcdef0123456789abcdef';
@@ -15,8 +15,9 @@ const KEY = '0123456789abcdef0123456789abcdef';
 // The one-second pause between lookups has its own test below.
 setPlaybackPacing(0);
 
-/** The episode a playback request asks for, from its gzip body. */
+/** The episode a playback request asks for, from its gzip body (the video_tab GET: its query). */
 function requestedVid(url, options) {
+  if (!options.body) return new URL(url).searchParams.get('video_id');
   return JSON.parse(zlib.gunzipSync(Buffer.from(options.body)).toString()).mixed_video_id_map[1004][0];
 }
 
@@ -217,8 +218,7 @@ test('playback requests are signed over the final query, the bytes sent and the 
       assert.equal(url.searchParams.get('channel'), 'vivo_8662_64');
       const ticket = Number(url.searchParams.get('_rticket'));
       assert.ok(ticket >= khronos * 1000 && ticket < khronos * 1000 + 2024, 'the ticket is searched from the signing time');
-      assert.equal(signed.headers['x-ss-req-ticket'], String(ticket));
-      assert.deepEqual(Object.keys(signed.headers).sort(), ['Accept', 'Content-Encoding', 'Content-Type', 'x-helios', 'x-khronos', 'x-medusa', 'x-ss-req-ticket', 'x-ss-stub']);
+      assert.deepEqual(Object.keys(signed.headers).sort(), ['Accept', 'Content-Encoding', 'Content-Type', 'x-helios', 'x-khronos', 'x-medusa', 'x-ss-stub']);
       const prefix = Buffer.from(signed.headers['x-medusa'], 'base64').subarray(0, 4);
       assert.equal((prefix.readUInt32LE() ^ khronos) >>> 0, 5, 'a v5 envelope');
       const other = new URL(playbackRequest(payload, identity, videoId, true).url);
@@ -273,6 +273,26 @@ test('an inline stream without its key is not played as clear video', async () =
   assert.equal((await getPlayInfo('9000000000000000016', '', { force: true })).contentKey, null);
 });
 
+// Upstream 7.7: the video_tab GET is signed like the player endpoint, over an empty body.
+test('the video_tab request is a v5 GET without a body or body headers', () => {
+  const identity = { device_id: REGISTERED.device_id_str, iid: REGISTERED.install_id_str, cdid: '00000000-0000-4000-8000-000000000000' };
+  const tab = videoTabRequest(identity, '9000000000000000099');
+  const url = new URL(tab.url);
+  assert.equal(tab.method, 'GET');
+  assert.equal(tab.body, null);
+  assert.equal(url.hostname, 'api5-normal-sinfonlineb.fqnovel.com');
+  assert.equal(url.pathname, '/reading/bookapi/video_tab/multi_video_model/v1/');
+  assert.deepEqual(Array.from(url.searchParams.keys()), ['aid', 'app_name', 'version_code', 'version_name', 'channel',
+    'device_platform', 'device_type', 'os_version', 'update_version_code', 'iid', 'cdid', 'device_id', 'video_id', 'video_id_type',
+    'device_level', 'need_all_video_definition', 'need_mp4_align', 'use_os_player', 'video_platform', 'source', 'from_video_id', '_rticket']);
+  assert.equal(url.searchParams.get('video_id'), '9000000000000000099');
+  assert.equal(url.searchParams.get('device_id'), identity.device_id);
+  assert.equal(url.searchParams.get('from_video_id'), '');
+  assert.deepEqual(Object.keys(tab.headers).sort(), ['Accept', 'x-helios', 'x-khronos', 'x-medusa']);
+  const prefix = Buffer.from(tab.headers['x-medusa'], 'base64').subarray(0, 4);
+  assert.equal((prefix.readUInt32LE() ^ Number(tab.headers['x-khronos'])) >>> 0, 5, 'a v5 envelope');
+});
+
 test('a failed registration is shared, then retried after 30 s', async () => {
   resetPlaybackDevice();
   let registrations = 0;
@@ -297,6 +317,10 @@ test('a failed registration is shared, then retried after 30 s', async () => {
 
 // Upstream 5.5/6.9/7.5: an empty answer from the player endpoint is asked again on the other
 // official host with the same device, and then gets one try on the older POST with a new one.
+// 7.7: the video_tab GET sits between the two, with the first device.
+const PLAYER = 'POST /novel/player/multi_video_model/player/v1';
+const TAB = 'GET /reading/bookapi/video_tab/multi_video_model/v1/';
+const OLDER = 'POST /novel/player/multi_video_model/v1/';
 function renewingTransport({ emptyFor = () => false, failRegistration = () => false, registrationReply } = {}) {
   const log = { registrations: 0, devices: [], paths: [], hosts: [] };
   setTransport(async (url, options) => {
@@ -327,33 +351,36 @@ function renewingTransport({ emptyFor = () => false, failRegistration = () => fa
   return log;
 }
 
-test('an empty player answer is asked on the other host, then once on the older POST with a new device', async () => {
+test('an empty player answer is asked on the other host, on video_tab, then once on the older POST with a new device', async () => {
   resetPlaybackDevice();
   const log = renewingTransport({ emptyFor: device => device === '4200000000000000001' });
   try {
     const info = await getPlayInfo('9000000000000000020', '', { force: true });
     assert.equal(info.url, MEDIA.main720);
     assert.equal(log.registrations, 2);
-    assert.deepEqual(log.devices, ['4200000000000000001', '4200000000000000001', '4200000000000000002']);
-    assert.deepEqual(log.paths, ['POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/v1/']);
-    assert.deepEqual(log.hosts, ['b', 'a', 'b']);
+    assert.deepEqual(log.devices, ['4200000000000000001', '4200000000000000001', '4200000000000000001', '4200000000000000002']);
+    assert.deepEqual(log.paths, [PLAYER, PLAYER, TAB, OLDER]);
+    assert.deepEqual(log.hosts, ['b', 'a', 'b', 'b']);
   } finally {
     resetPlaybackDevice();
   }
 });
 
-test('a lookup asks each endpoint at most once, and keeps its device when re-registration fails', async () => {
+test('a round asks each endpoint at most once, and keeps its device when re-registration fails', async () => {
   resetPlaybackDevice();
   const log = renewingTransport({ emptyFor: () => true });
   await assert.rejects(getPlayInfo('9000000000000000022', '', { force: true }), /均未提供播放地址/);
-  assert.equal(log.devices.length, 3, 'both hosts of the player endpoint, then one attempt on the older endpoint only');
+  // Upstream 7.7: an empty round is asked again with new devices, three rounds at most.
+  assert.deepEqual(log.paths, [PLAYER, PLAYER, TAB, OLDER, PLAYER, PLAYER, TAB, OLDER, PLAYER, PLAYER, TAB, OLDER]);
+  assert.equal(log.registrations, 6);
+  assert.equal(new Set(log.devices).size, 6, 'each round starts with a new device and renews it once');
   resetPlaybackDevice();
 
   const failing = renewingTransport({ emptyFor: device => device === '4200000000000000001', failRegistration: n => n === 2 });
   await assert.rejects(getPlayInfo('9000000000000000026', '', { force: true }), /均未提供播放地址/);
   assert.equal(failing.registrations, 2);
-  assert.deepEqual(failing.devices, ['4200000000000000001', '4200000000000000001', '4200000000000000001'], 'the older endpoint still gets the first device');
-  assert.deepEqual(failing.paths, ['POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/v1/']);
+  assert.deepEqual(failing.devices, ['4200000000000000001', '4200000000000000001', '4200000000000000001', '4200000000000000001'], 'the older endpoint still gets the first device');
+  assert.deepEqual(failing.paths, [PLAYER, PLAYER, TAB, OLDER], 'no further round while registration is failing');
   resetPlaybackDevice();
 });
 
@@ -372,7 +399,7 @@ test('a refused re-registration stops the lookup and the ones queued behind it',
     assert.match(failed.message, /设备注册被拒绝/);
     assert.equal((await queued).error, failed, 'the queued lookup fails with the same refusal');
     assert.equal(log.registrations, 2, 'nothing registers after the refusal');
-    assert.deepEqual(log.paths, ['POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/player/v1'], 'the older endpoint is not asked with the previous device');
+    assert.deepEqual(log.paths, [PLAYER, PLAYER, TAB], 'the older endpoint is not asked with the previous device');
   }
   resetPlaybackDevice();
   setPlaybackPacing(0);
@@ -383,12 +410,12 @@ test('a re-registration that fails for a passing reason keeps the one try on the
   for (const failure of passing) {
     resetPlaybackDevice();
     setPlaybackPacing(0);
-    const log = renewingTransport({ emptyFor: device => device === '4200000000000000001' && log.paths.length < 3, registrationReply: n => (n === 2 ? failure : null) });
+    const log = renewingTransport({ emptyFor: device => device === '4200000000000000001' && log.paths.length < 4, registrationReply: n => (n === 2 ? failure : null) });
     const info = await fetchAppPlayUrl('9000000000000000042');
     assert.equal(info.url, MEDIA.main720);
     assert.equal(log.registrations, 2);
-    assert.deepEqual(log.devices, ['4200000000000000001', '4200000000000000001', '4200000000000000001']);
-    assert.deepEqual(log.paths, ['POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/player/v1', 'POST /novel/player/multi_video_model/v1/']);
+    assert.deepEqual(log.devices, ['4200000000000000001', '4200000000000000001', '4200000000000000001', '4200000000000000001']);
+    assert.deepEqual(log.paths, [PLAYER, PLAYER, TAB, OLDER]);
   }
   resetPlaybackDevice();
   setPlaybackPacing(0);
@@ -579,4 +606,56 @@ test('an App refusal also fails the lookups waiting behind it; later ones ask ag
   fake({ api: () => { calls++; throw new HttpError('HTTP 503', 503); } });
   await Promise.all(['9000000000000000314', '9000000000000000315'].map(vid => fetchAppPlayUrl(vid).catch(() => null)));
   assert.equal(calls, 2);
+});
+
+// Upstream 7.7: the video_tab GET answers when both hosts of the player endpoint are empty.
+test('video_tab answers an empty player endpoint with the same device', async () => {
+  resetPlaybackDevice();
+  const log = renewingTransport({ emptyFor: () => /player\/v1$/.test(log.paths[log.paths.length - 1]) });
+  const info = await fetchAppPlayUrl('9000000000000000401');
+  assert.equal(info.url, MEDIA.main720);
+  assert.equal(log.registrations, 1);
+  assert.deepEqual(log.paths, [PLAYER, PLAYER, TAB]);
+  assert.equal(new Set(log.devices).size, 1);
+  resetPlaybackDevice();
+});
+
+// Upstream 7.7: business code 110001 and a timeout are about this anonymous device or this
+// moment, so the lookup is asked again with a new device and nothing queued is stopped.
+test('business code 110001 or a timeout asks again with a new device; other refusals do not', async () => {
+  const stream = { codec_type: 'h264', definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } };
+  const ok = (url, options) => ({ status: 200, url, header: () => null, data: JSON.stringify({ code: 0, data: { 1004: { [requestedVid(url, options)]: { video_model: { video_list: [stream] } } } } }) });
+  const firsts = [
+    url => ({ status: 200, url, header: () => null, data: '{"code":110001}' }),
+    () => { throw Object.assign(new HttpError('请求超时', 0), { timeout: true }); },
+  ];
+  for (const first of firsts) {
+    resetPlaybackDevice();
+    let calls = 0;
+    const requested = fake({ api: (url, options) => (++calls === 1 ? first(url) : ok(url, options)) });
+    assert.equal((await fetchAppPlayUrl('9000000000000000411')).url, MEDIA.main720);
+    assert.equal(calls, 2);
+    assert.equal(requested.filter(u => /device_register/.test(u)).length, 2);
+  }
+  // Always turned away: three rounds, and the lookup behind it is still sent.
+  resetPlaybackDevice();
+  let calls = 0;
+  fake({ api: url => { calls++; return { status: 200, url, header: () => null, data: '{"code":110001}' }; } });
+  const results = await Promise.all(['9000000000000000412', '9000000000000000413'].map(vid => fetchAppPlayUrl(vid).then(() => null, error => error)));
+  assert.ok(results.every(error => error && error.rejected === false && error.businessCode === 110001));
+  assert.equal(calls, 6);
+  // Any other business code is a refusal: one request, and the queue stops.
+  calls = 0;
+  fake({ api: url => { calls++; return { status: 200, url, header: () => null, data: '{"code":1001}' }; } });
+  const refused = await Promise.all(['9000000000000000414', '9000000000000000415'].map(vid => fetchAppPlayUrl(vid).then(() => null, error => error)));
+  assert.ok(refused.every(error => error && error.rejected === true));
+  assert.equal(calls, 1);
+  // A lost connection (no timeout) is the TV's network: not asked again.
+  setPlaybackPacing(0);
+  calls = 0;
+  fake({ api: () => { calls++; throw new HttpError('网络连接失败', 0); } });
+  await assert.rejects(fetchAppPlayUrl('9000000000000000416'), error => error.network === true);
+  assert.equal(calls, 1);
+  setPlaybackPacing(0);
+  resetPlaybackDevice();
 });

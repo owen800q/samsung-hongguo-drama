@@ -119,14 +119,13 @@ test('v5: the first ticket on the signed branch is chosen, and query, body and s
     assert.ok(query.includes('text=%E4%B8%AD%E6%96%87%20%21*%27%28%29~%20%2B%26%3D%25'));
     assert.equal(url.searchParams.get('ts'), null);
     assert.equal(signed.headers['x-khronos'], String(ts));
-    assert.equal(signed.headers['x-ss-req-ticket'], String(ticket));
     assert.equal(signed.headers['x-ss-stub'], md5(BODY).toString('hex').toUpperCase());
     const prefix = Buffer.from(signed.headers['x-medusa'], 'base64').subarray(0, 20);
     const time = Buffer.alloc(4); time.writeUInt32LE(ts);
     for (let at = 0; at < prefix.length; at++) prefix[at] ^= time[at & 3];
     assert.equal(prefix.readUInt32LE(), 5);
     assert.equal(prefix.subarray(4).toString('hex'), '2d4b4fca49750d433fb5ae2c226dcc56');
-    assert.deepEqual(Object.keys(signed.headers).sort(), ['x-helios', 'x-khronos', 'x-medusa', 'x-ss-req-ticket', 'x-ss-stub']);
+    assert.deepEqual(Object.keys(signed.headers).sort(), ['x-helios', 'x-khronos', 'x-medusa', 'x-ss-stub']);
   }
   assert.equal(new URL(signPlaybackV5({ base: BASE, values: Object.assign({}, VALUES, { ts: '1' }), body: BODY, now: NOW + 999 }).url).searchParams.get('ts'), String(NOW / 1000));
 });
@@ -212,7 +211,23 @@ test('v5: an identity that is not a registered device, or a body that is not gzi
     Object.assign({}, VALUES, { device_id: '1.2' }), Object.assign({}, VALUES, { cdid: '' }), Object.assign({}, VALUES, { version_name: '' })]) {
     assert.throws(() => signPlaybackV5(Object.assign({}, valid, { values })), TypeError);
   }
-  for (const body of [undefined, null, '', new Uint8Array(0), utf8('{}')]) {
+  for (const body of [undefined, '', new Uint8Array(0), utf8('{}')]) {
     assert.throws(() => signPlaybackV5(Object.assign({}, valid, { body })), TypeError);
   }
+});
+
+// Upstream 7.7: a GET is signed over the digest of an empty body and carries no x-ss-stub.
+test('v5: a request without a body is signed over the empty-body digest', t => {
+  setV5Entropy(fixed(0x80), NOW);
+  t.after(() => setV5Entropy());
+  const now = NOW + 999, ts = Math.floor(now / 1000);
+  const signed = signPlaybackV5({ base: BASE, values: VALUES, body: null, now });
+  const query = signed.url.split('?')[1];
+  assert.deepEqual(Object.keys(signed.headers).sort(), ['x-helios', 'x-khronos', 'x-medusa']);
+  assert.equal(branch(query, Buffer.alloc(0), ts), 12);
+  const ticket = Number(new URL(signed.url).searchParams.get('_rticket'));
+  for (let previous = now; previous < ticket; previous++) {
+    assert.notEqual(branch(query.replace(/_rticket=\d+/, '_rticket=' + previous), Buffer.alloc(0), ts), 12);
+  }
+  assert.notEqual(signed.headers['x-medusa'], signPlaybackV5({ base: BASE, values: VALUES, body: BODY, now }).headers['x-medusa']);
 });

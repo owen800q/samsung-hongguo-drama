@@ -54,7 +54,7 @@ function xhrTransport(url, options) {
       header: name => xhr.getResponseHeader(name),
     });
     xhr.onerror = () => done(reject, new HttpError('网络连接失败', 0));
-    xhr.ontimeout = () => done(reject, new HttpError('请求超时', 0));
+    xhr.ontimeout = () => done(reject, Object.assign(new HttpError('请求超时', 0), { timeout: true }));
     xhr.onabort = () => done(reject, new HttpError('已取消', -1));
     if (options.onProgress) xhr.onprogress = e => options.onProgress(e.loaded, e.lengthComputable ? e.total : 0);
     if (options.cancel) unsubscribe = options.cancel.subscribe(() => xhr.abort());
