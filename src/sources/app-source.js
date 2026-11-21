@@ -8,8 +8,11 @@
 // upstream 6.9 replaced the Gorgon/Medusa/Helios headers with real Argus/Ladon ones).
 // Upstream 7.5: the player endpoint, signed with v5 x-helios / x-medusa headers
 // (playback-v5.js), is asked first, then the same request on the other official host, and
-// the older Argus/Ladon POST only after empty answers; the video_tab GET of 6.7-7.4 now
-// answers empty and is gone. Lookups take turns, one second apart (upstream 6.9).
+// the older Argus/Ladon POST only after empty answers. Upstream 7.7: the video_tab GET
+// belongs to the player family too, so it is asked with v5 headers and no body after both
+// hosts answered empty, and a lookup that ends empty, timed out or with business code
+// 110001 is asked again with a new anonymous device, three rounds at most.
+// Lookups take turns, one second apart (upstream 6.9).
 // SDK protocol constants below are not user credentials.
 import { request } from '../lib/http.js';
 import { getPlaybackDevice } from './playback-device.js';
@@ -20,6 +23,7 @@ import { utf8, fromUtf8, fromHex, fromBase64, concat, gzipStored } from '../lib/
 
 const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
 const PLAYER_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/player/v1';
+const VIDEO_TAB_API = 'https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/';
 const DEVICE = {
   ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
   version_code: '71332', version_name: '7.1.3.32', device_platform: 'android', os: 'android',
@@ -85,6 +89,21 @@ export function playbackRequest(payload, identity, videoId, alternate) {
   };
   return { url: VIDEO_API + '?' + query, body, headers, method: 'POST' };
 }
+// Upstream 7.7: the video_tab GET for one episode. Signed like the player endpoint, with
+// the digest of an empty body and none of the headers that describe a body; the older
+// Argus/Ladon headers get an empty answer here.
+export function videoTabRequest(identity, videoId) {
+  const signed = signPlaybackV5({
+    base: VIDEO_TAB_API,
+    values: Object.assign({}, PLAYER_PROFILE, {
+      iid: identity.iid, cdid: identity.cdid, device_id: identity.device_id,
+      video_id: String(videoId), video_id_type: '0', device_level: '1', need_all_video_definition: '1',
+      need_mp4_align: '0', use_os_player: '0', video_platform: '1024', source: '0', from_video_id: '',
+    }),
+    body: null, now: Date.now(),
+  });
+  return { url: signed.url, body: null, method: 'GET', headers: Object.assign({}, signed.headers, { Accept: 'application/json' }) };
+}
 function parseFallback(value) {
   if (typeof value === 'string') { const parsed = jsonBody(value); return (parsed && parsed.fallback_api) || value; }
   if (Array.isArray(value)) return str(value[0]);
@@ -138,7 +157,7 @@ function checkedUrl(value, domains) {
 async function requestJson(url, options, deadline) {
   url = checkedUrl(url, ['fqnovel.com', 'snssdk.com']);
   const timeout = deadline - Date.now();
-  if (timeout <= 0) throw Object.assign(new Error('App 片源请求超时'), { network: true });
+  if (timeout <= 0) throw Object.assign(new Error('App 片源请求超时'), { network: true, timedOut: true });
   let res;
   try {
     res = await request(url, Object.assign({}, options, { responseType: 'text', timeout }));
@@ -146,7 +165,7 @@ async function requestJson(url, options, deadline) {
     // Upstream 5.7: 403/429 is the App refusing this TV, not a passing outage.
     if (error && error.status > 0) throw Object.assign(new Error('App 片源请求失败（HTTP ' + error.status + '）'), { status: error.status, rejected: error.status === 403 || error.status === 429 });
     // No response at all: the TV's connection, not the source, is the likely cause.
-    throw Object.assign(new Error('App 片源请求失败，请稍后重试'), { network: true });
+    throw Object.assign(new Error('App 片源请求失败，请稍后重试'), { network: true, timedOut: !!(error && error.timeout) });
   }
   // XHR follows redirects itself; make sure we still ended on an allowed host.
   if (res.url) checkedUrl(res.url, ['fqnovel.com', 'snssdk.com']);
@@ -169,7 +188,14 @@ function shortEdge(item) {
 
 const REGISTRATION_REFUSALS = ['BUSINESS_REJECTED', 'HTTP_403', 'HTTP_429'];
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-function businessRejected() { return Object.assign(new Error('App 接口暂未提供本集播放信息'), { rejected: true }); }
+// Upstream 7.7: business code 110001 is the App turning this anonymous device away, not the
+// episode: it does not stop other lookups, and the lookup is asked again with a new device.
+const DEVICE_TURNED_AWAY = 110001;
+function businessRejected(code) {
+  const businessCode = Number(code) || 0;
+  return Object.assign(new Error('App 接口暂未提供本集播放信息'), { rejected: businessCode !== DEVICE_TURNED_AWAY, businessCode });
+}
+const LOOKUP_ROUNDS = 3;
 
 // Upstream 6.9 (#138/#139): playback and prefetch lookups, registration included, take
 // turns, and the next one starts a second after the last ended, so a burst of requests does
@@ -199,7 +225,16 @@ export function fetchAppPlayUrl(vid, options = {}) {
     const pause = readyAt - Date.now();
     if (pause > 0) await wait(pause);
     try {
-      return await fetchAppPlayUrlFresh(vid, options);
+      for (let round = 1; ; round++) {
+        try {
+          return await fetchAppPlayUrlFresh(vid, options);
+        } catch (error) {
+          // Upstream 7.7: an empty, timed-out or turned-away round is asked again with a
+          // new device. A failed registration and every other error end the lookup.
+          const again = error && !error.registration && (error.empty || error.timedOut || error.businessCode === DEVICE_TURNED_AWAY);
+          if (!again || round >= LOOKUP_ROUNDS) throw error;
+        }
+      }
     } catch (error) {
       if (error && error.rejected) lastRefusal = error;
       throw error;
@@ -214,13 +249,17 @@ export function fetchAppPlayUrl(vid, options = {}) {
 async function fetchAppPlayUrlFresh(vid, options) {
   const wanted = options.quality === '720p' || options.quality === '1080p' ? options.quality : 'auto';
   const payload = JSON.stringify({
-    biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false, disable_video_relate_book: false, need_all_video_definition: true, need_mp4_align: false, use_os_player: false, use_server_dns: false, video_platform: 1024 },
+    biz_param: { detail_page_version: 0, device_level: 1, disable_digg_stat: false, disable_video_relate_book: false, need_all_video_definition: true, need_mp4_align: false, use_os_player: false, use_server_dns: false, video_platform: 1024 },
     mixed_video_id_map: { 1004: [vid] },
     dr_scene: 'player',
   });
   // Upstream 5.5: a registered identity may only be good for one playback request, so each
   // lookup registers its own. Registration has its own 8 s budget, outside the 12 s below.
-  let identity = await getPlaybackDevice(requestJson);
+  let identity;
+  try { identity = await getPlaybackDevice(requestJson); } catch (error) {
+    if (error && typeof error === 'object') error.registration = true;
+    throw error;
+  }
   const deadline = Date.now() + 12000;
   let response;
   for (let attempt = 0; ; attempt++) {
@@ -233,7 +272,14 @@ async function fetchAppPlayUrlFresh(vid, options) {
         if (attempt || !error.empty || deadline - Date.now() < 1000) throw error;
         // An empty answer may still be answered by the other official host, same identity.
         const alternate = playbackRequest(payload, identity, vid, true);
-        response = await requestJson(alternate.url, { method: alternate.method, headers: alternate.headers, body: alternate.body }, deadline);
+        try {
+          response = await requestJson(alternate.url, { method: alternate.method, headers: alternate.headers, body: alternate.body }, deadline);
+        } catch (alternateError) {
+          if (!alternateError.empty || deadline - Date.now() < 1000) throw alternateError;
+          // Upstream 7.7: then the video_tab GET for this episode, same identity.
+          const tab = videoTabRequest(identity, vid);
+          response = await requestJson(tab.url, { method: tab.method, headers: tab.headers }, deadline);
+        }
       }
       break;
     } catch (error) {
@@ -251,7 +297,7 @@ async function fetchAppPlayUrlFresh(vid, options) {
       await wait(pacingGap);
     }
   }
-  if (Number(response.Code || response.code || 0) !== 0) throw businessRejected();
+  if (Number(response.Code || response.code || 0) !== 0) throw businessRejected(response.Code || response.code);
   // The player endpoint nests the models under "1004" (older answers under video_model_data
   // or not at all); either way only the asked episode counts.
   const entries = response.data && (response.data['1004'] != null ? response.data['1004']

@@ -294,7 +294,7 @@ function encode(value) {
  * The final URL and signature headers for one playback request. `values` are the query
  * fields, in order, and must carry the registered device_id / iid / cdid together with
  * version_name, channel, os_version and device_type; `body` is the gzip body exactly as it
- * will be sent. `_rticket` is the first of `now` .. `now + 1023` whose request falls on the
+ * will be sent, or `null` for a GET. `_rticket` is the first of `now` .. `now + 1023` whose request falls on the
  * branch v5 signs, so the returned URL has to be sent unchanged.
  */
 export function signPlaybackV5({ base, values, body, now = Date.now() }) {
@@ -309,11 +309,13 @@ export function signPlaybackV5({ base, values, body, now = Date.now() }) {
   ['cdid', 'version_name', 'channel', 'os_version', 'device_type'].forEach(key => {
     if (!who[key] || !who[key].trim()) throw new TypeError('V5 ' + key + ' is required');
   });
-  if (!(body instanceof Uint8Array) || body.length < 18 || body[0] !== 0x1f || body[1] !== 0x8b || body[2] !== 8) {
+  // Upstream 7.7: a GET has no body (`null`); its digest is that of no bytes at all.
+  const hasBody = body !== null;
+  if (hasBody && (!(body instanceof Uint8Array) || body.length < 18 || body[0] !== 0x1f || body[1] !== 0x8b || body[2] !== 8)) {
     throw new TypeError('V5 body must be gzip bytes');
   }
   const ts = Math.floor(now / 1000);
-  const bodyHash = md5(body);
+  const bodyHash = md5(hasBody ? body : new Uint8Array(0));
   if (Object.prototype.hasOwnProperty.call(who, 'ts')) who.ts = String(ts);
   for (let offset = 0; offset < 1024; offset++) {
     const ticket = String(now + offset);
@@ -325,13 +327,10 @@ export function signPlaybackV5({ base, values, body, now = Date.now() }) {
     const queryHash = sm3(utf8(text));
     if (branch(queryHash, bodyHash, ts) !== 12) continue;
     const f13 = hashF13(queryHash, bodyHash, ts);
-    return {
-      url: base + '?' + text,
-      headers: {
-        'x-khronos': String(ts), 'x-helios': helios(ts), 'x-medusa': medusa(queryHash, f13, ts, who),
-        'x-ss-stub': toHex(bodyHash).toUpperCase(), 'x-ss-req-ticket': ticket,
-      },
-    };
+    const headers = { 'x-khronos': String(ts), 'x-helios': helios(ts), 'x-medusa': medusa(queryHash, f13, ts, who) };
+    // Upstream 7.7: no x-ss-req-ticket, and x-ss-stub only when there is a body to describe.
+    if (hasBody) headers['x-ss-stub'] = toHex(bodyHash).toUpperCase();
+    return { url: base + '?' + text, headers };
   }
   throw new Error('Unable to select V5 playback signature branch within 1024 tickets');
 }
