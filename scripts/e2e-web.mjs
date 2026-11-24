@@ -481,6 +481,8 @@ try {
   const protMedia = [];
   let protPages = 0;
   await prot.route(/hongguoduanju\.com\/video\//, route => { protMedia.push(route.request().url()); return route.abort(); });
+  // This check is about the App source; the website's public stream has its own below.
+  await prot.route(/fallback-play-info/, route => route.fulfill({ status: 403, contentType: 'application/json', body: '{"error":"public_fallback_unavailable"}' }));
   await prot.route(/hongguoduanju\.com\/player\/[^?]*\/\d+/, async route => {
     try {
       const res = await route.fetch();
@@ -506,6 +508,64 @@ try {
   const protError = await prot.evaluate(() => ((document.querySelector('.player-error') || {}).textContent || '').trim());
   check('a protected preview page falls back to the App source', protPages > 0 && /^blob:/.test(protSrc) && protMedia.length === 0, protSrc + ' protected pages: ' + protPages + ', web hits: ' + protMedia.length + (protError ? ', error: ' + protError.slice(0, 120) : ''));
   await prot.close();
+
+  // Upstream 8.0: every App endpoint answers empty (as the platform did in November 2026):
+  // a protected episode then plays the website's public stream, a clear MP4 of the whole
+  // episode, asked for only after the App. The App and the public endpoint are mocked here.
+  const pub = await ctx.newPage();
+  await pub.addInitScript(() => { window.tizen = { tvinputdevice: { registerKey() {} }, application: { getCurrentApplication: () => ({ exit() {} }) } }; });
+  pub.on('pageerror', e => errors.push('public fallback page: ' + e));
+  const pubOrder = [];
+  const PUBLIC_MEDIA = 'https://v3-hgweb.qznovelvod.com/e2e-public/360p.mp4';
+  await pub.route(/api5-normal/, route => { pubOrder.push('app'); return route.fulfill({ status: 200, contentType: 'application/json', body: '' }); });
+  await pub.route(/hongguoduanju\.com\/api\/video\/protected\/fallback-play-info/, route => {
+    pubOrder.push('public');
+    let asked = '';
+    try { asked = String(JSON.parse(route.request().postData() || '{}').item_id || ''); } catch (_) {}
+    if (!/^\d+$/.test(asked) || route.request().method() !== 'POST') return route.fulfill({ status: 400, body: '' });
+    return route.fulfill({ status: 200, contentType: 'application/json',
+      body: JSON.stringify({ main_url: PUBLIC_MEDIA, url_expire: Math.floor(Date.now() / 1000) + 3600, base_resp: { StatusCode: 0, StatusMessage: '' } }) });
+  });
+  await pub.route(/qznovelvod\.com\/e2e-public\//, route => {
+    const m = /bytes=(\d+)-(\d*)/.exec(route.request().headers().range || '');
+    if (!m) return route.fulfill({ status: 200, contentType: 'video/webm', headers: { 'accept-ranges': 'bytes' }, body: clip });
+    const start = Number(m[1]); const end = m[2] ? Number(m[2]) : clip.length - 1;
+    return route.fulfill({ status: 206, contentType: 'video/webm', body: clip.subarray(start, end + 1),
+      headers: { 'accept-ranges': 'bytes', 'content-range': `bytes ${start}-${end}/${clip.length}` } });
+  });
+  const pubPreview = [];
+  await pub.route(/hongguoduanju\.com\/video\//, route => { pubPreview.push(route.request().url()); return route.abort(); });
+  await pub.route(/hongguoduanju\.com\/player\/[^?]*\/\d+/, async route => {
+    try {
+      const res = await route.fetch();
+      const body = (await res.text()).replace(/"protectedPlayback":(true|false),?/g, '').replace(/"publicVideoSeo":/g, '"protectedPlayback":true,"publicVideoSeo":');
+      await route.fulfill({ response: res, body });
+    } catch (_) { /* a prefetch still in flight when the page closes */ }
+  });
+  await pub.goto(URL_);
+  await pub.waitForSelector('.poster.focusable', { timeout: 30000 });
+  await pub.evaluate(() => document.querySelector('.poster.focusable').focus());
+  await pub.keyboard.press('Enter');
+  await pub.waitForSelector('.detail .btn-primary:not([disabled])', { timeout: 30000 });
+  await pub.waitForTimeout(600);
+  await pub.keyboard.press('Enter');
+  const pubEnd = Date.now() + 90000;
+  let pubState = null;
+  while (Date.now() < pubEnd) {
+    await pub.waitForTimeout(500);
+    pubState = await pub.evaluate(() => {
+      const v = document.querySelector('video.player-video');
+      const e = document.querySelector('.player-error');
+      return { src: v ? v.currentSrc || v.src : '', t: v ? v.currentTime : 0, paused: v ? v.paused : true, error: e ? e.textContent.trim().slice(0, 120) : '' };
+    });
+    if (pubState.error || (pubState.src === PUBLIC_MEDIA && pubState.t > 0.5 && !pubState.paused)) break;
+  }
+  const firstPublic = pubOrder.indexOf('public');
+  check('with every App endpoint empty, a protected episode plays the website public stream, asked after the App',
+    !!pubState && !pubState.error && pubState.src === PUBLIC_MEDIA && pubState.t > 0.5 && firstPublic >= 12 &&
+      pubOrder.slice(0, firstPublic).every(x => x === 'app') && pubPreview.length === 0,
+    JSON.stringify({ state: pubState, appRequestsFirst: firstPublic, preview: pubPreview.length }));
+  await pub.close();
 
   // Upstream 4.8: in auto quality a decrypted App stream the TV cannot decode is swapped for
   // the next stream down, at most twice, then the error is shown with 重试 focused. This
@@ -546,6 +606,8 @@ try {
     return route.fulfill({ response, body });
   });
   await swap.route(/hongguoduanju\.com\/video\//, route => route.abort());
+  // Only App streams are swapped; without this the website's public stream would play instead.
+  await swap.route(/fallback-play-info/, route => route.fulfill({ status: 403, contentType: 'application/json', body: '{"error":"public_fallback_unavailable"}' }));
   await swap.route(/hongguoduanju\.com\/player\/[^?]*\/\d+/, async route => {
     try {
       const res = await route.fetch();
@@ -640,7 +702,8 @@ try {
     return route.fulfill({ status: 206, contentType: 'video/webm', body: clip.subarray(start, end + 1),
       headers: { 'accept-ranges': 'bytes', 'content-range': `bytes ${start}-${end}/${clip.length}` } });
   });
-  // Episode pages by vid: the first one plays; the second fails (website and App) for 5 s.
+  // Episode pages by vid: the first one plays; the second fails (website, App and the
+  // website's public stream) for 5 s.
   const vids = [];
   const nextHits = [];
   const nextEnds = [];
@@ -659,7 +722,7 @@ try {
     } catch (_) { /* request outlived the page */ }
     if (hit >= 0) nextEnds[hit] = Date.now();
   });
-  await pre.route(/fqnovel\.com/, route => (blockUntil && Date.now() < blockUntil ? route.abort('connectionreset') : route.continue()));
+  await pre.route(/fqnovel\.com|fallback-play-info/, route => (blockUntil && Date.now() < blockUntil ? route.abort('connectionreset') : route.continue()));
   await pre.goto(URL_);
   await pre.waitForSelector('.poster.focusable', { timeout: 30000 });
   await pre.evaluate(() => document.querySelector('.poster.focusable').focus());
