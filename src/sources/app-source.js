@@ -3,19 +3,22 @@
 // commit 22261adfa31435e3b3ef5a730b8a2a75bcaf1715, spider/js/红果果[短].js,
 // via N3urda/hongguoTV eea73e6a45569a2cbbb9440f7cd5290c459b0b70, and the desktop
 // hongguo-drama app. TV changes: Uint8Array instead of Buffer, pure JS hashes, and no
-// User-Agent header (browsers cannot set it). Playback uses a freshly registered anonymous
+// User-Agent header (browsers cannot set it). Playback uses a registered anonymous
 // device (playback-device.js, upstream 3.9/5.5) and signed requests (playback-signature.js:
 // upstream 6.9 replaced the Gorgon/Medusa/Helios headers with real Argus/Ladon ones).
 // Upstream 7.5: the player endpoint, signed with v5 x-helios / x-medusa headers
 // (playback-v5.js), is asked first, then the same request on the other official host, and
 // the older Argus/Ladon POST only after empty answers. Upstream 7.7: the video_tab GET
-// belongs to the player family too, so it is asked with v5 headers and no body after both
-// hosts answered empty, and a lookup that ends empty, timed out or with business code
-// 110001 is asked again with a new anonymous device, three rounds at most.
+// belongs to the player family too, signed with v5 headers and no body.
+// Upstream 8.0/8.1: one anonymous device is kept across lookups, and a lookup asks
+// video_tab, the player endpoint on both hosts, the single-episode model endpoint on two
+// more hosts and the older POST in turn, each once more after an empty answer. The device
+// is replaced, at most once per lookup, after business code 110001 or empty answers (see
+// fetchAppPlayUrl).
 // Lookups take turns, one second apart (upstream 6.9).
 // SDK protocol constants below are not user credentials.
 import { request } from '../lib/http.js';
-import { getPlaybackDevice } from './playback-device.js';
+import { getPlaybackDevice, resetPlaybackDevice } from './playback-device.js';
 import { signPlayer } from './playback-signature.js';
 import { signPlaybackV5 } from './playback-v5.js';
 import { sha512, aes128CbcDecrypt } from '../lib/crypto.js';
@@ -24,6 +27,11 @@ import { utf8, fromUtf8, fromHex, fromBase64, concat, gzipStored } from '../lib/
 const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
 const PLAYER_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/player/v1';
 const VIDEO_TAB_API = 'https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/';
+// Upstream 8.0: the single-episode model endpoint, on two further official hosts.
+const MODEL_APIS = [
+  'https://api5-normal-sinfonlinea.fqnovel.com/novel/player/video_model/v1/',
+  'https://api5-normal-sinfonlinec.fqnovel.com/novel/player/video_model/v1/',
+];
 const DEVICE = {
   ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
   version_code: '71332', version_name: '7.1.3.32', device_platform: 'android', os: 'android',
@@ -88,6 +96,26 @@ export function playbackRequest(payload, identity, videoId, alternate) {
     'Content-Type': 'application/json; charset=UTF-8', 'Content-Encoding': 'gzip', 'x-ss-stub': signature['x-ss-stub'],
   };
   return { url: VIDEO_API + '?' + query, body, headers, method: 'POST' };
+}
+// Upstream 8.0: one episode's model from the single-episode endpoint at `base`, signed and
+// sent like the player endpoint.
+export function playbackModelRequest(identity, videoId, base) {
+  const body = gzipStored(utf8(JSON.stringify({
+    biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false, from_video_id: '',
+      need_all_video_definition: true, need_mp4_align: false, source: 9, use_os_player: false,
+      use_server_dns: false, video_platform: 3 },
+    content_type: 1004,
+    video_id: String(videoId),
+  })));
+  const signed = signPlaybackV5({
+    base,
+    values: Object.assign({}, PLAYER_PROFILE, { iid: identity.iid, cdid: identity.cdid, device_id: identity.device_id }),
+    body, now: Date.now(),
+  });
+  return {
+    url: signed.url, body, method: 'POST',
+    headers: Object.assign({}, signed.headers, { Accept: 'application/json', 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip' }),
+  };
 }
 // Upstream 7.7: the video_tab GET for one episode. Signed like the player endpoint, with
 // the digest of an empty body and none of the headers that describe a body; the older
@@ -186,7 +214,6 @@ function shortEdge(item) {
   return 0;
 }
 
-const REGISTRATION_REFUSALS = ['BUSINESS_REJECTED', 'HTTP_403', 'HTTP_429'];
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 // Upstream 7.7: business code 110001 is the App turning this anonymous device away, not the
 // episode: it does not stop other lookups, and the lookup is asked again with a new device.
@@ -195,7 +222,11 @@ function businessRejected(code) {
   const businessCode = Number(code) || 0;
   return Object.assign(new Error('App 接口暂未提供本集播放信息'), { rejected: businessCode !== DEVICE_TURNED_AWAY, businessCode });
 }
-const LOOKUP_ROUNDS = 3;
+// Upstream 8.0: an empty answer is asked once more after this pause before the next endpoint.
+const EMPTY_RETRY_MS = 250;
+// Upstream 8.0: a device is replaced after empty answers at most this often, so a passing
+// block on the App's side does not turn into a burst of registrations.
+const DEVICE_RESET_GAP_MS = 30000;
 
 // Upstream 6.9 (#138/#139): playback and prefetch lookups, registration included, take
 // turns, and the next one starts a second after the last ended, so a burst of requests does
@@ -204,12 +235,23 @@ let pacingGap = 1000;
 let queue = Promise.resolve();
 let readyAt = 0;
 let lastRefusal = null;
+let emptyLookups = 0;
+let deviceResetAt = 0;
 
-/** Tests only: the pause between lookups, in ms. Also forgets the last refusal. */
+/** Tests only: the pause between lookups, in ms. Also forgets the last refusal and the device. */
 export function setPlaybackPacing(ms) {
   pacingGap = ms == null ? 1000 : ms;
   readyAt = 0;
   lastRefusal = null;
+  emptyLookups = 0;
+  deviceResetAt = 0;
+  resetPlaybackDevice();
+}
+
+function replaceDevice() {
+  resetPlaybackDevice();
+  deviceResetAt = Date.now();
+  emptyLookups = 0;
 }
 
 /**
@@ -224,18 +266,27 @@ export function fetchAppPlayUrl(vid, options = {}) {
     if (lastRefusal !== refusalBefore) throw lastRefusal;
     const pause = readyAt - Date.now();
     if (pause > 0) await wait(pause);
+    const turnedAway = error => !!error && error.businessCode === DEVICE_TURNED_AWAY;
     try {
-      for (let round = 1; ; round++) {
-        try {
-          return await fetchAppPlayUrlFresh(vid, options);
-        } catch (error) {
-          // Upstream 7.7: an empty, timed-out or turned-away round is asked again with a
-          // new device. A failed registration and every other error end the lookup.
-          const again = error && !error.registration && (error.empty || error.timedOut || error.businessCode === DEVICE_TURNED_AWAY);
-          if (!again || round >= LOOKUP_ROUNDS) throw error;
-        }
+      try {
+        return await fetchAppPlayUrlFresh(vid, options);
+      } catch (error) {
+        // Upstream 8.0/8.1: a lookup every endpoint answered empty, or that the App turned
+        // this device away from, is asked once more with a new device; after empty answers
+        // only when the device was not replaced in the last 30 s.
+        const empty = !!error && !!error.empty && !error.registration;
+        if (!turnedAway(error) && !(empty && Date.now() - deviceResetAt >= DEVICE_RESET_GAP_MS)) throw error;
+        replaceDevice();
+        return await fetchAppPlayUrlFresh(vid, options);
       }
     } catch (error) {
+      // The lookup failed for good. Upstream 8.0: a device that was turned away is not used
+      // again, and one that keeps getting empty or timed-out lookups is replaced for the
+      // next lookup once two have ended that way and 30 s have passed.
+      if (error && !error.registration && (error.empty || error.timedOut || turnedAway(error))) {
+        emptyLookups++;
+        if (turnedAway(error) || (emptyLookups >= 2 && Date.now() - deviceResetAt >= DEVICE_RESET_GAP_MS)) replaceDevice();
+      }
       if (error && error.rejected) lastRefusal = error;
       throw error;
     } finally {
@@ -253,50 +304,46 @@ async function fetchAppPlayUrlFresh(vid, options) {
     mixed_video_id_map: { 1004: [vid] },
     dr_scene: 'player',
   });
-  // Upstream 5.5: a registered identity may only be good for one playback request, so each
-  // lookup registers its own. Registration has its own 8 s budget, outside the 12 s below.
+  // Upstream 8.0: lookups share one registered identity instead of registering one each
+  // (fetchAppPlayUrl decides when it is replaced). Registration has its own 8 s budget,
+  // outside the 12 s below.
   let identity;
   try { identity = await getPlaybackDevice(requestJson); } catch (error) {
     if (error && typeof error === 'object') error.registration = true;
     throw error;
   }
   const deadline = Date.now() + 12000;
-  let response;
-  for (let attempt = 0; ; attempt++) {
-    // Upstream 7.5: the player endpoint first; only an empty answer gets one try on the older POST.
-    const signed = playbackRequest(payload, identity, attempt ? '' : vid);
-    try {
+  // Upstream 8.1: video_tab first, then the player endpoint on both hosts, the
+  // single-episode model endpoint on two more, and the older Argus/Ladon POST last. Only an
+  // empty answer moves on to the next endpoint; any other failure ends the lookup.
+  const routes = [
+    () => videoTabRequest(identity, vid),
+    () => playbackRequest(payload, identity, vid),
+    () => playbackRequest(payload, identity, vid, true),
+  ].concat(MODEL_APIS.map(base => () => playbackModelRequest(identity, vid, base)), [
+    () => playbackRequest(payload, identity, ''),
+  ]);
+  let response = null;
+  let emptyError = null;
+  for (let r = 0; r < routes.length && !response; r++) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // Out of time after empty answers: that, not the TV's network, is what went wrong.
+      if (emptyError && deadline - Date.now() < 1000) throw emptyError;
+      // Each attempt is signed anew: the signature covers the time it is sent at.
+      const signed = routes[r]();
       try {
-        response = await requestJson(signed.url, { method: signed.method, headers: signed.headers, body: signed.body }, deadline);
+        response = await requestJson(signed.url, signed.body ? { method: signed.method, headers: signed.headers, body: signed.body }
+          : { method: signed.method, headers: signed.headers }, deadline);
+        break;
       } catch (error) {
-        if (attempt || !error.empty || deadline - Date.now() < 1000) throw error;
-        // An empty answer may still be answered by the other official host, same identity.
-        const alternate = playbackRequest(payload, identity, vid, true);
-        try {
-          response = await requestJson(alternate.url, { method: alternate.method, headers: alternate.headers, body: alternate.body }, deadline);
-        } catch (alternateError) {
-          if (!alternateError.empty || deadline - Date.now() < 1000) throw alternateError;
-          // Upstream 7.7: then the video_tab GET for this episode, same identity.
-          const tab = videoTabRequest(identity, vid);
-          response = await requestJson(tab.url, { method: tab.method, headers: tab.headers }, deadline);
-        }
+        if (!error.empty) throw error;
+        emptyError = error;
+        if (!attempt && deadline - Date.now() >= 1000) await wait(Math.min(EMPTY_RETRY_MS, pacingGap));
       }
-      break;
-    } catch (error) {
-      if (attempt || !error.empty || deadline - Date.now() < 1000) throw error;
-      // With a new identity when time allows. Upstream 7.0: when that registration is
-      // refused outright (HTTP 403/429 or a business refusal), the lookup ends with the
-      // refusal instead of sending the previous identity again; a timeout, network or
-      // server error keeps the previous one.
-      if (deadline - Date.now() >= 8000) {
-        try { identity = await getPlaybackDevice(requestJson); } catch (registrationError) {
-          if (registrationError && REGISTRATION_REFUSALS.indexOf(registrationError.registrationFailure) >= 0) throw registrationError;
-        }
-      }
-      if (deadline - Date.now() < 1500) throw error;
-      await wait(pacingGap);
     }
   }
+  if (!response) throw emptyError;
+  emptyLookups = 0;
   if (Number(response.Code || response.code || 0) !== 0) throw businessRejected(response.Code || response.code);
   // The player endpoint nests the models under "1004" (older answers under video_model_data
   // or not at all); either way only the asked episode counts.

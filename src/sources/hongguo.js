@@ -186,6 +186,40 @@ async function fetchPlayUrlFromWeb(vid, sid) {
   return null;
 }
 
+// Upstream 8.0: the endpoint the website's own player asks when a page is protected. For
+// the episodes the site shows publicly it answers with the full episode as a clear
+// 360 x 640 H.264 MP4 (not the ~10 s preview of the page's metadata), and it kept
+// answering in November 2026 while every App endpoint returned empty bodies.
+const PUBLIC_FALLBACK_API = SITE + '/api/video/protected/fallback-play-info';
+
+/**
+ * The website's public stream for `vid`, or null when the answer is unusable. Rejects with
+ * `publicLimited` when the site does not offer the episode publicly (HTTP 403).
+ */
+export async function fetchPublicFallbackPlayUrl(vid) {
+  if (!/^\d{1,30}$/.test(String(vid))) return null;
+  let payload;
+  try {
+    payload = await getJson(PUBLIC_FALLBACK_API, {
+      method: 'POST', timeout: 6000, headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ item_id: String(vid) }),
+    });
+  } catch (error) {
+    if (error && error.status === 403) throw Object.assign(new Error('官网公开片源不提供本集'), { publicLimited: true });
+    throw error;
+  }
+  if (!payload || typeof payload !== 'object') return null;
+  const status = payload.base_resp && payload.base_resp.StatusCode != null ? payload.base_resp.StatusCode : payload.code;
+  if (Number(status || 0) !== 0) return null;
+  let media;
+  try { media = new URL(normalizeVideoUrl(payload.main_url)); } catch (_) { return null; }
+  if (media.protocol !== 'https:' || media.username || media.password || !isPublicMediaUrl(media.href) ||
+      !/(^|\.)(?:qznovelvod|fqnovelvod|douyinvod)\.com$/i.test(media.hostname)) return null;
+  const expires = Number(payload.url_expire);
+  if (isFinite(expires) && expires > 0 && expires * 1000 <= Date.now() + 5000) return null;
+  return { url: media.href, contentKey: null, codec: 'h264', quality: '360p', source: 'web', vid: String(vid) };
+}
+
 // Episodes whose website CDN address just failed to load, until when (ms).
 const failedWebMedia = new Map();
 
@@ -220,6 +254,14 @@ async function fetchPlayInfoFresh(vid, sid, skipWeb) {
     const web = await fetchPlayUrlFromWeb(vid, sid);
     if (web) return web;
   }
+  // Upstream 8.0/8.1: when the App gave nothing, the website's public 360P stream of the
+  // whole episode is the last resort. It comes after the App so that it never replaces a
+  // better App stream. An episode that only exists as ByteVC2 may still play this way.
+  let publicLimited = false;
+  try {
+    const fallback = await fetchPublicFallbackPlayUrl(vid);
+    if (fallback) return fallback;
+  } catch (error) { publicLimited = !!(error && error.publicLimited); }
   if (appError && appError.network) throw new Error('网络连接失败，未能获取播放地址，请检查电视网络后重试');
   // Upstream 5.6: an episode that only exists as ByteVC2 will not play however often it is retried.
   if (appError && appError.code === 'UNSUPPORTED_CODEC') throw Object.assign(new Error(appError.message), { appRejected: true });
@@ -229,6 +271,8 @@ async function fetchPlayInfoFresh(vid, sid, skipWeb) {
     const range = accessible > 0 ? '仅提供前 ' + accessible + ' 集' : '暂未提供可播放分集';
     throw Object.assign(new Error('红果官网当前' + range + '，第 ' + (index + 1) + ' 集暂时无法获取播放地址，请稍后重试。'), rejected);
   }
+  // Upstream 8.1: the site said outright that this episode is not public.
+  if (publicLimited) throw Object.assign(new Error('官网公开片源不提供本集，备用接口也未返回播放地址。请稍后重试；若该集只对官方 App 开放，请在官方 App 观看。'), rejected);
   throw Object.assign(new Error('红果官网与备用接口均未提供播放地址，请稍后重试'), rejected);
 }
 

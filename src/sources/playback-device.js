@@ -6,8 +6,9 @@
 // TV changes: pure JS SHA-512/AES and stored-block gzip (no Node crypto or zlib), no
 // User-Agent header (browsers cannot set it), and a failed registration is retried after
 // 30 s instead of only after a restart, since a TV may open the app before its network is up.
-// Upstream 5.5: each playback lookup registers its own device, since one identity may only
-// be accepted for a single playback request.
+// Upstream 8.0: playback lookups share one registered device until app-source.js replaces
+// it (5.5 registered one per lookup, which turned a passing block into a burst of
+// registrations).
 // Anonymous phone profile only: no login, cookies or tokens; the identity lives in memory.
 import { md5, sha512, aes128CbcEncrypt } from '../lib/crypto.js';
 import { utf8, toHex, fromHex, concat, gzipStored } from '../lib/bytes.js';
@@ -16,6 +17,7 @@ const REGISTER_URL = 'https://log5-applog-lf.fqnovel.com/service/2/device_regist
 const KDF_SALT = fromHex('4dd4c2e6b83162090e52b3c7a6733ba41cb2462b829ab58a196b39db57177524f49baf7f08e8d68d26a72e37c1a95a2f1f05a51892aef2949732b62a38aadd58');
 const RETRY_AFTER_MS = 30000;
 let failure = null;
+let registration = null;
 
 function randomBytes(n) {
   const out = new Uint8Array(n);
@@ -106,20 +108,26 @@ export async function registerPlaybackDevice(requestJson) {
 }
 
 /**
- * A newly registered anonymous identity for one playback lookup (upstream 5.5). After a
- * failed registration, lookups in the next 30 s fail with the same error instead of
+ * The anonymous identity playback lookups share (upstream 8.0), registered on first use.
+ * After a failed registration, lookups in the next 30 s fail with the same error instead of
  * registering again, so a broken endpoint is not hammered by playback and prefetch.
  */
 export function getPlaybackDevice(requestJson) {
   if (failure && Date.now() - failure.at < RETRY_AFTER_MS) return Promise.reject(failure.error);
   failure = null;
-  return registerPlaybackDevice(requestJson).then(identity => identity, error => {
-    failure = { at: Date.now(), error };
-    throw error;
-  });
+  if (!registration) {
+    const pending = registerPlaybackDevice(requestJson).then(identity => identity, error => {
+      if (registration === pending) registration = null;
+      failure = { at: Date.now(), error };
+      throw error;
+    });
+    registration = pending;
+  }
+  return registration;
 }
 
-/** Tests only. */
+/** Forget the shared identity, so the next lookup registers a new one. */
 export function resetPlaybackDevice() {
+  registration = null;
   failure = null;
 }
