@@ -15,6 +15,9 @@
 // more hosts and the older POST in turn, each once more after an empty answer. The device
 // is replaced, at most once per lookup, after business code 110001 or empty answers (see
 // fetchAppPlayUrl).
+// Upstream 8.2: the current App's preload endpoint is asked before all of those, the endpoint
+// that last gave a usable model is asked first from then on, and a model whose listed streams
+// the TV cannot use is asked again through its fallback_api for an HEVC or H.264 one.
 // Lookups take turns, one second apart (upstream 6.9).
 // SDK protocol constants below are not user credentials.
 import { request } from '../lib/http.js';
@@ -27,6 +30,8 @@ import { utf8, fromUtf8, fromHex, fromBase64, concat, gzipStored } from '../lib/
 const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
 const PLAYER_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/player/v1';
 const VIDEO_TAB_API = 'https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/';
+// Upstream 8.2: the current App's preload endpoint, asked first.
+const PRELOAD_API = 'https://reading.snssdk.com/novel/player/multi_video_model/preload/v1';
 // Upstream 8.0: the single-episode model endpoint, on two further official hosts.
 const MODEL_APIS = [
   'https://api5-normal-sinfonlinea.fqnovel.com/novel/player/video_model/v1/',
@@ -50,6 +55,14 @@ const PLAYBACK_DEVICE = appVersion('74332', '7.4.3.32');
 const PLAYER_PROFILE = {
   aid: '8662', app_name: 'novelread', version_code: '74332', version_name: '7.4.3.32', channel: 'vivo_8662_64',
   device_platform: 'android', device_type: 'PGT-AN10', os_version: '12', update_version_code: '74332',
+};
+// Upstream 8.2: the profile the preload request was observed with, in query order.
+const PRELOAD_PROFILE = {
+  aid: '8662', app_name: 'novelread', version_code: '74532', version_name: '7.4.5.32',
+  update_version_code: '74532', manifest_version_code: '74532', os: 'android', ssmix: 'a',
+  channel: 'update_64', device_platform: 'android', device_type: '25053RT47C',
+  device_brand: 'Redmi', os_version: '16', os_api: '36', ac: 'wifi', language: 'zh',
+  host_abi: 'arm64-v8a',
 };
 
 function str(value, fallback = '') { return String(value == null ? fallback : value).trim(); }
@@ -111,6 +124,27 @@ export function playbackModelRequest(identity, videoId, base) {
     base,
     values: Object.assign({}, PLAYER_PROFILE, { iid: identity.iid, cdid: identity.cdid, device_id: identity.device_id }),
     body, now: Date.now(),
+  });
+  return {
+    url: signed.url, body, method: 'POST',
+    headers: Object.assign({}, signed.headers, { Accept: 'application/json', 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip' }),
+  };
+}
+// Upstream 8.2: the current App's preload request for one episode: a v5-signed gzip POST like
+// the player endpoint, with its own profile, device_level 2 and a different field 21 in the
+// signed message.
+export function preloadRequest(identity, videoId) {
+  const body = gzipStored(utf8(JSON.stringify({
+    biz_param: { detail_page_version: 0, device_level: 2, disable_digg_stat: false,
+      disable_video_relate_book: false, need_all_video_definition: true, need_mp4_align: false,
+      use_os_player: false, use_server_dns: false, video_platform: 1024 },
+    mixed_video_id_map: { 1004: [String(videoId)] },
+    dr_scene: 'preload',
+  })));
+  const signed = signPlaybackV5({
+    base: PRELOAD_API,
+    values: Object.assign({}, PRELOAD_PROFILE, { iid: identity.iid, cdid: identity.cdid, device_id: identity.device_id }),
+    body, now: Date.now(), field21: 312,
   });
   return {
     url: signed.url, body, method: 'POST',
@@ -237,6 +271,8 @@ let readyAt = 0;
 let lastRefusal = null;
 let emptyLookups = 0;
 let deviceResetAt = 0;
+// Upstream 8.2: the endpoint that last gave a usable model is asked first.
+let preferredRoute = '';
 
 /** Tests only: the pause between lookups, in ms. Also forgets the last refusal and the device. */
 export function setPlaybackPacing(ms) {
@@ -245,6 +281,7 @@ export function setPlaybackPacing(ms) {
   lastRefusal = null;
   emptyLookups = 0;
   deviceResetAt = 0;
+  preferredRoute = '';
   resetPlaybackDevice();
 }
 
@@ -313,27 +350,34 @@ async function fetchAppPlayUrlFresh(vid, options) {
     throw error;
   }
   const deadline = Date.now() + 12000;
-  // Upstream 8.1: video_tab first, then the player endpoint on both hosts, the
-  // single-episode model endpoint on two more, and the older Argus/Ladon POST last. Only an
-  // empty answer moves on to the next endpoint; any other failure ends the lookup.
-  const routes = [
-    () => videoTabRequest(identity, vid),
-    () => playbackRequest(payload, identity, vid),
-    () => playbackRequest(payload, identity, vid, true),
-  ].concat(MODEL_APIS.map(base => () => playbackModelRequest(identity, vid, base)), [
-    () => playbackRequest(payload, identity, ''),
+  // Upstream 8.2: the preload endpoint first; 8.1: then video_tab, the player endpoint on
+  // both hosts, the single-episode model endpoint on two more, and the older Argus/Ladon
+  // POST last. Only an empty answer moves on to the next endpoint; any other failure ends
+  // the lookup. 8.2: the endpoint that last gave a usable model goes to the front.
+  const candidates = [
+    { id: 'preload', create: () => preloadRequest(identity, vid) },
+    { id: 'video_tab', create: () => videoTabRequest(identity, vid) },
+    { id: 'player_b', create: () => playbackRequest(payload, identity, vid) },
+    { id: 'player_a', create: () => playbackRequest(payload, identity, vid, true) },
+  ].concat(MODEL_APIS.map((base, index) => ({ id: 'model_' + index, create: () => playbackModelRequest(identity, vid, base) })), [
+    { id: 'legacy', create: () => playbackRequest(payload, identity, '') },
   ]);
+  const first = candidates.filter(route => route.id === preferredRoute);
+  const routes = first.concat(candidates.filter(route => route.id !== preferredRoute));
   let response = null;
   let emptyError = null;
+  let answeredBy = '';
+  const usable = result => { preferredRoute = answeredBy; return result; };
   for (let r = 0; r < routes.length && !response; r++) {
     for (let attempt = 0; attempt < 2; attempt++) {
       // Out of time after empty answers: that, not the TV's network, is what went wrong.
       if (emptyError && deadline - Date.now() < 1000) throw emptyError;
       // Each attempt is signed anew: the signature covers the time it is sent at.
-      const signed = routes[r]();
+      const signed = routes[r].create();
       try {
         response = await requestJson(signed.url, signed.body ? { method: signed.method, headers: signed.headers, body: signed.body }
           : { method: signed.method, headers: signed.headers }, deadline);
+        answeredBy = routes[r].id;
         break;
       } catch (error) {
         if (!error.empty) throw error;
@@ -352,9 +396,16 @@ async function fetchAppPlayUrlFresh(vid, options) {
   const entry = entries && entries[vid];
   const model = entry && (typeof entry.video_model === 'string' ? jsonBody(entry.video_model) : entry.video_model);
   if (!model || typeof model !== 'object' || Array.isArray(model)) throw new Error('App 接口未返回所选分集');
-  const readFallback = async () => {
-    const fallback = parseFallback(model.fallback_api);
+  // `codec` / `forceCodec` (upstream 8.2) ask the fallback model for a given codec.
+  const readFallback = async (codec, forceCodec) => {
+    let fallback = parseFallback(model.fallback_api);
     if (!fallback) throw new Error('App 接口未返回本集片源地址');
+    if (codec) {
+      const target = new URL(fallback);
+      target.searchParams.set('codec_type', codec);
+      if (forceCodec) target.searchParams.set('force_codec', forceCodec);
+      fallback = target.href;
+    }
     const outer = await requestJson(fallback, {}, deadline);
     if ([outer, outer.video_info].some(value => Number((value && (value.Code || value.code)) || 0) !== 0)) throw businessRejected();
     return outer.video_info && outer.video_info.data;
@@ -362,23 +413,41 @@ async function fetchAppPlayUrlFresh(vid, options) {
   // The current model lists the streams directly (an array, or an object keyed by stream);
   // older ones only point to a fallback_api.
   const inline = !!model.video_list && typeof model.video_list === 'object' && Object.keys(model.video_list).length > 0;
-  if (!inline) return parsePlayModel(await readFallback(), wanted, false, 0);
+  if (!inline) return usable(parsePlayModel(await readFallback(), wanted, false, 0));
   try {
-    return parsePlayModel(model, wanted, true, 0);
+    return usable(parsePlayModel(model, wanted, true, 0));
   } catch (error) {
     // Upstream 5.5: an inline model whose streams carry no encryption info at all may still
     // be read from its fallback_api, once. That model must be the same video with the same
     // full length, state its encryption, and offer nothing smaller than the inline stream.
+    // Upstream 8.2: an inline model with no stream the TV can use (codec or chosen quality)
+    // is asked again through its fallback_api, for HEVC and then for H.264, under the same
+    // identity checks.
     const duration = Number(model.video_duration);
-    if (!error.missingEncryptionInfo || !error.minimumEdge || typeof model.video_id !== 'string' || !model.video_id.trim()
+    const codecFallback = ['NO_COMPATIBLE_SOURCE', 'QUALITY_UNAVAILABLE', 'UNSUPPORTED_CODEC'].indexOf(error.code) >= 0;
+    if ((error.missingEncryptionInfo ? !error.minimumEdge : !codecFallback) || typeof model.video_id !== 'string' || !model.video_id.trim()
       || !isFinite(duration) || duration <= 0 || !model.fallback_api) throw error;
-    const info = await readFallback();
-    const fallbackDuration = Number(info && info.video_duration);
-    if (!info || info.video_id !== model.video_id || !isFinite(fallbackDuration) || fallbackDuration <= 0
-      || Math.abs(fallbackDuration - duration) > 0.5) {
-      throw new Error('备用片源编号或完整时长无法确认，已停止取址');
+    const sameVideo = info => {
+      const fallbackDuration = Number(info && info.video_duration);
+      if (!info || info.video_id !== model.video_id || !isFinite(fallbackDuration) || fallbackDuration <= 0
+        || Math.abs(fallbackDuration - duration) > 0.5) {
+        throw new Error('备用片源编号或完整时长无法确认，已停止取址');
+      }
+      return info;
+    };
+    if (error.missingEncryptionInfo) return usable(parsePlayModel(sameVideo(await readFallback()), wanted, true, error.minimumEdge));
+    const asks = [['1'], ['0', 'h264']];
+    for (let i = 0; i < asks.length; i++) {
+      let info;
+      try { info = sameVideo(await readFallback(asks[i][0], asks[i][1])); } catch (fallbackError) {
+        // An HTTP refusal or a lost connection is the real failure; otherwise the first
+        // error, which names the codec or quality, says more than the fallback's.
+        if (fallbackError && (fallbackError.status || fallbackError.network)) throw fallbackError;
+        continue;
+      }
+      try { return usable(parsePlayModel(info, wanted, false, 0)); } catch (_) { /* next codec */ }
     }
-    return parsePlayModel(info, wanted, true, error.minimumEdge);
+    throw error;
   }
 }
 
@@ -392,7 +461,7 @@ function parsePlayModel(info, wanted, requireEncryptionInfo, minimumEdge) {
   // Samsung TVs decode HEVC in hardware, so resolution still outranks codec here
   // (the desktop app now prefers H.264 because it may have to transcode HEVC). The real
   // size outranks the quality label, which is sometimes wrong or missing.
-  const compatible = Object.keys(list).map(k => list[k]).filter(item => item && (item.main_url || item.backup_url || Array.isArray(item.backup_url_list))).map(item => {
+  const compatible = Object.keys(list).map(k => list[k]).filter(item => item && (item.main_url || item.backup_url || item.backup_url_1 || Array.isArray(item.backup_url_list))).map(item => {
     const meta = item.video_meta || {};
     const codec = str(item.codec_type || meta.codec_type).toLowerCase();
     const codecRank = ['h264', 'avc', 'avc1'].indexOf(codec) >= 0 ? 0 : ['hevc', 'h265', 'hvc1', 'hev1', 'bytevc1'].indexOf(codec) >= 0 ? 1 : 2;
@@ -429,7 +498,7 @@ function parsePlayModel(info, wanted, requireEncryptionInfo, minimumEdge) {
     const selected = rows[r];
     const backups = Array.isArray(selected.item.backup_url_list) ? selected.item.backup_url_list : [];
     let contentKey;
-    for (const candidate of [selected.item.main_url, selected.item.backup_url].concat(backups)) {
+    for (const candidate of [selected.item.main_url, selected.item.backup_url, selected.item.backup_url_1].concat(backups)) {
       if (typeof candidate !== 'string' || !candidate) continue;
       try {
         const media = info.key_seed ? decryptSpadeUrl(candidate, fromBase64(info.key_seed)) : cleanUrl(candidate);

@@ -228,7 +228,7 @@ function xmxor(data, key) {
 }
 
 /** The protobuf message x-medusa carries, before the envelope transform. */
-export function medusaMessage(query, f13, ts, who) {
+export function medusaMessage(query, f13, ts, who, field21 = 377) {
   processIdentity();
   const flags = new Uint8Array(8);
   const device = proto([[1, 1, 'sint'], [2, 2, 'sint'], [3, '8662'], [4, who.device_id],
@@ -240,12 +240,12 @@ export function medusaMessage(query, f13, ts, who) {
     [6, '646637794'], [7, who.version_name], [8, 'v04.10.03-ml-android'], [9, 0x040a0300, 'sint'],
     [10, flags], [12, ts, 'sint'], [13, f13], [14, query.subarray(0, 6)],
     [15, proto([[1, 1, 'sint'], [2, 1, 'sint'], [3, 1, 'sint'], [5, 1, 'sint']])],
-    [17, ts, 'sint'], [20, 'none'], [21, 377, 'sint'], [23, env],
+    [17, ts, 'sint'], [20, 'none'], [21, field21, 'sint'], [23, env],
     [24, '{"cmr":16777216,"cmr2":16777216,"un_h":11,"vpn":0,"kd":0,"dyn":"","do":1,"tk":true}']]);
 }
 
-function medusa(query, f13, ts, who) {
-  const message = medusaMessage(query, f13, ts, who);
+function medusa(query, f13, ts, who, field21) {
+  const message = medusaMessage(query, f13, ts, who, field21);
   const nonce = random32(); const high = (nonce >>> 16) & 255;
   const hash = sm3(concat([SIGN_KEY, le32(nonce), SIGN_KEY]));
   const seed = le32(~(((high << 11) | (nonce >>> 24)) ^ (high >>> 5) ^ high));
@@ -295,9 +295,11 @@ function encode(value) {
  * fields, in order, and must carry the registered device_id / iid / cdid together with
  * version_name, channel, os_version and device_type; `body` is the gzip body exactly as it
  * will be sent, or `null` for a GET. `_rticket` is the first of `now` .. `now + 1023` whose request falls on the
- * branch v5 signs, so the returned URL has to be sent unchanged.
+ * branch v5 signs, so the returned URL has to be sent unchanged. `field21` is a number the
+ * signed message carries: 377 for the player profile, 312 for the preload one (upstream 8.2).
  */
-export function signPlaybackV5({ base, values, body, now = Date.now() }) {
+export function signPlaybackV5({ base, values, body, now = Date.now(), field21 = 377 }) {
+  if (typeof field21 !== 'number' || field21 % 1 !== 0 || field21 < 0 || field21 > 0xffff) throw new RangeError('V5 field21 must be an unsigned 16-bit integer');
   const who = {};
   Object.keys(values).forEach(key => {
     if (typeof values[key] !== 'string') throw new TypeError('V5 query fields must be strings');
@@ -327,7 +329,7 @@ export function signPlaybackV5({ base, values, body, now = Date.now() }) {
     const queryHash = sm3(utf8(text));
     if (branch(queryHash, bodyHash, ts) !== 12) continue;
     const f13 = hashF13(queryHash, bodyHash, ts);
-    const headers = { 'x-khronos': String(ts), 'x-helios': helios(ts), 'x-medusa': medusa(queryHash, f13, ts, who) };
+    const headers = { 'x-khronos': String(ts), 'x-helios': helios(ts), 'x-medusa': medusa(queryHash, f13, ts, who, field21) };
     // Upstream 7.7: no x-ss-req-ticket, and x-ss-stub only when there is a body to describe.
     if (hasBody) headers['x-ss-stub'] = toHex(bodyHash).toUpperCase();
     return { url: base + '?' + text, headers };

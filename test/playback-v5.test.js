@@ -231,3 +231,18 @@ test('v5: a request without a body is signed over the empty-body digest', t => {
   }
   assert.notEqual(signed.headers['x-medusa'], signPlaybackV5({ base: BASE, values: VALUES, body: BODY, now }).headers['x-medusa']);
 });
+
+// Upstream 8.2: the preload profile signs with another value in field 21 of the message.
+test('v5: field 21 of the message can be chosen and defaults to 377', t => {
+  setV5Entropy(fixed(0x80), NOW);
+  t.after(() => setV5Entropy());
+  const query = sm3(utf8('a=b')), f13 = new Uint8Array(20).fill(7);
+  assert.equal(sint(fields(medusaMessage(query, f13, NOW / 1000, VALUES, 312)), 21), 312);
+  assert.equal(sint(fields(medusaMessage(query, f13, NOW / 1000, VALUES)), 21), 377);
+  const valid = { base: BASE, values: VALUES, body: BODY, now: NOW };
+  assert.notEqual(signPlaybackV5(Object.assign({}, valid, { field21: 312 })).headers['x-medusa'], signPlaybackV5(valid).headers['x-medusa']);
+  assert.equal(signPlaybackV5(Object.assign({}, valid, { field21: 312 })).url, signPlaybackV5(valid).url);
+  for (const field21 of [-1, 1.5, 0x10000, '312', null]) {
+    assert.throws(() => signPlaybackV5(Object.assign({}, valid, { field21 })), RangeError);
+  }
+});

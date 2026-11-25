@@ -7,7 +7,7 @@ import { resolvePlayback, setPlayMaxBytes } from '../src/media/playback.js';
 import { resetPlaybackDevice } from '../src/sources/playback-device.js';
 import zlib from 'node:zlib';
 import { createHash } from 'node:crypto';
-import { playbackRequest, playbackModelRequest, videoTabRequest, fetchAppPlayUrl, setPlaybackPacing } from '../src/sources/app-source.js';
+import { playbackRequest, playbackModelRequest, videoTabRequest, preloadRequest, fetchAppPlayUrl, setPlaybackPacing } from '../src/sources/app-source.js';
 import { signPlayer } from '../src/sources/playback-signature.js';
 
 const KEY = '0123456789abcdef0123456789abcdef';
@@ -64,7 +64,7 @@ function fake({ outer, api, media = {} } = {}) {
     const reply = (status, data, type = 'application/json') => ({ status, data, url, header: n => (n === 'content-type' ? type : null) });
     if (/hongguoduanju\.com/.test(url)) return reply(500, '');
     if (/device_register/.test(url)) return reply(200, JSON.stringify(REGISTERED));
-    if (/api5-normal/.test(url)) {
+    if (/api5-normal|reading\.snssdk\.com/.test(url)) {
       if (api) return api(url, options);
       const vid = requestedVid(url, options);
       return reply(200, JSON.stringify({ code: 0, data: { video_model_data: { [vid]: { video_model: JSON.stringify({ fallback_api: 'https://vas.snssdk.com/video/fallback' }) } } } }));
@@ -186,7 +186,7 @@ test('app playback lookups share one anonymous device and send it', async () => 
   await getPlayInfo('9000000000000000012', '', { force: true });
   await getPlayInfo('9000000000000000013', '', { force: true });
   assert.equal(requested.filter(u => /device_register/.test(u)).length, 1);
-  const calls = requested.filter(u => /api5-normal/.test(u)).map(u => new URL(u).searchParams);
+  const calls = requested.filter(u => /api5-normal|reading\.snssdk\.com/.test(u)).map(u => new URL(u).searchParams);
   assert.equal(calls.length, 2);
   assert.ok(calls.every(q => q.get('device_id') === REGISTERED.device_id_str && q.get('iid') === REGISTERED.install_id_str));
   assert.ok(/^[0-9a-f-]{36}$/.test(calls[0].get('cdid')) && calls[1].get('cdid') === calls[0].get('cdid'));
@@ -259,7 +259,7 @@ test('the current inline model plays without asking the fallback address', async
   const info = await getPlayInfo('9000000000000000014', '', { force: true });
   assert.deepEqual(info.variants.map(v => v.url), [MEDIA.main1080, MEDIA.main720]);
   assert.ok(info.variants.every(v => v.contentKey === KEY));
-  assert.ok(!requested.some(u => /snssdk/.test(u)));
+  assert.ok(!requested.some(u => /vas\.snssdk/.test(u)));
 });
 
 test('an inline stream without its key is not played as clear video', async () => {
@@ -319,13 +319,15 @@ test('a failed registration is shared, then retried after 30 s', async () => {
 
 // Upstream 8.0/8.1: a lookup asks video_tab, the player endpoint on both hosts, the
 // single-episode model endpoint on two more hosts, then the older POST, all with one device.
+// Upstream 8.2: the current App's preload endpoint (host "reading") is asked before them.
+const PRELOAD = 'POST /novel/player/multi_video_model/preload/v1';
 const PLAYER = 'POST /novel/player/multi_video_model/player/v1';
 const TAB = 'GET /reading/bookapi/video_tab/multi_video_model/v1/';
 const MODEL = 'POST /novel/player/video_model/v1/';
 const OLDER = 'POST /novel/player/multi_video_model/v1/';
 const twice = list => list.reduce((all, item) => all.concat([item, item]), []);
-const ROUND = twice([TAB, PLAYER, PLAYER, MODEL, MODEL, OLDER]);
-const ROUND_HOSTS = twice(['b', 'b', 'a', 'a', 'c', 'b']);
+const ROUND = twice([PRELOAD, TAB, PLAYER, PLAYER, MODEL, MODEL, OLDER]);
+const ROUND_HOSTS = twice(['reading', 'b', 'b', 'a', 'a', 'c', 'b']);
 function renewingTransport({ emptyFor = () => false, failRegistration = () => false, registrationReply } = {}) {
   const log = { registrations: 0, devices: [], paths: [], hosts: [] };
   setTransport(async (url, options) => {
@@ -338,11 +340,11 @@ function renewingTransport({ emptyFor = () => false, failRegistration = () => fa
       if (failRegistration(log.registrations)) return reply(200, '{"code":0}');
       return reply(200, JSON.stringify({ device_id_str: '42000000000000000' + String(log.registrations).padStart(2, '0'), install_id_str: '4300000000000000001' }));
     }
-    if (/api5-normal/.test(url)) {
+    if (/api5-normal|reading\.snssdk\.com/.test(url)) {
       const device = new URL(url).searchParams.get('device_id');
       log.devices.push(device);
       log.paths.push((options.method || 'GET') + ' ' + new URL(url).pathname);
-      log.hosts.push(new URL(url).hostname.split('.')[0].slice(-1));
+      log.hosts.push(new URL(url).hostname.split('.')[0].replace(/^api5-normal-sinfonline/, ''));
       if (emptyFor(device)) return reply(200, '');
       const vid = requestedVid(url, options);
       const entry = { video_model: { video_list: [
@@ -364,13 +366,13 @@ test('an empty answer is asked once more, then on the next endpoint, all with th
   assert.equal(info.url, MEDIA.main720);
   assert.equal(log.registrations, 1);
   assert.equal(new Set(log.devices).size, 1);
-  assert.deepEqual(log.paths, ROUND.slice(0, 11));
-  assert.deepEqual(log.hosts, ROUND_HOSTS.slice(0, 11));
+  assert.deepEqual(log.paths, ROUND.slice(0, 13));
+  assert.deepEqual(log.hosts, ROUND_HOSTS.slice(0, 13));
   // An endpoint that answers on its second try ends the lookup there.
   setPlaybackPacing(0);
   const second = renewingTransport({ emptyFor: () => second.paths.length < 4 });
   assert.equal((await fetchAppPlayUrl('9000000000000000021')).url, MEDIA.main720);
-  assert.deepEqual(second.paths, [TAB, TAB, PLAYER, PLAYER]);
+  assert.deepEqual(second.paths, [PRELOAD, PRELOAD, TAB, TAB]);
   setPlaybackPacing(0);
 });
 
@@ -382,12 +384,12 @@ test('a lookup answered empty everywhere is asked once more with a new device, a
     await assert.rejects(getPlayInfo('9000000000000000022', '', { force: true }), /均未提供播放地址/);
     assert.deepEqual(log.paths, ROUND.concat(ROUND));
     assert.equal(log.registrations, 2);
-    assert.deepEqual(log.devices, new Array(12).fill('4200000000000000001').concat(new Array(12).fill('4200000000000000002')));
+    assert.deepEqual(log.devices, new Array(14).fill('4200000000000000001').concat(new Array(14).fill('4200000000000000002')));
     // Within 30 s the next lookups keep that device: one round each, no new registration.
     await assert.rejects(fetchAppPlayUrl('9000000000000000023'), error => error.empty === true);
     await assert.rejects(fetchAppPlayUrl('9000000000000000024'), error => error.empty === true);
     assert.equal(log.registrations, 2);
-    assert.equal(log.paths.length, 48);
+    assert.equal(log.paths.length, 56);
     // After 30 s an empty lookup gets a new device again.
     const later = now() + 31000;
     Date.now = () => later;
@@ -405,7 +407,7 @@ test('the new device answers after the first one got empty answers', async () =>
   const log = renewingTransport({ emptyFor: device => device === '4200000000000000001' });
   assert.equal((await fetchAppPlayUrl('9000000000000000026')).url, MEDIA.main720);
   assert.equal(log.registrations, 2);
-  assert.deepEqual(log.paths, ROUND.concat([TAB]));
+  assert.deepEqual(log.paths, ROUND.concat([PRELOAD]));
   // The next lookup keeps the device that worked.
   assert.equal((await fetchAppPlayUrl('9000000000000000027')).url, MEDIA.main720);
   assert.equal(log.registrations, 2);
@@ -452,7 +454,7 @@ test('inline streams without encryption info are read from the checked fallback 
   const info = await getPlayInfo('9000000000000000060', '', { force: true });
   assert.deepEqual(info.variants.map(v => v.url), [MEDIA.backup1080]);
   assert.equal(info.contentKey, KEY);
-  assert.equal(requested.filter(u => /snssdk/.test(u)).length, 1);
+  assert.equal(requested.filter(u => /vas\.snssdk/.test(u)).length, 1);
 
   // Another video, another length, or a model that still hides its encryption: refused.
   for (const [vid, data] of [
@@ -492,12 +494,12 @@ test('an inline stream that states an unusable encryption does not ask the fallb
     video_list: [{ codec_type: 'h264', definition: '1080p', main_url: MEDIA.main1080, vwidth: 1080, vheight: 1920, encrypt_info: { encrypt: true } }],
   });
   await assert.rejects(getPlayInfo('9000000000000000065', '', { force: true }), /均未提供播放地址/);
-  assert.ok(!requested.some(u => /snssdk/.test(u)));
+  assert.ok(!requested.some(u => /vas\.snssdk/.test(u)));
   const unsized = inlineWithoutKeys('9000000000000000066', { video_id: 'v0abc', video_duration: 61.2, video_list: videoList() }, {
     video_list: [{ codec_type: 'h264', definition: '1080p', main_url: MEDIA.main1080 }],
   });
   await assert.rejects(getPlayInfo('9000000000000000066', '', { force: true }), /均未提供播放地址/);
-  assert.ok(!unsized.some(u => /snssdk/.test(u)), 'the inline size must be known to compare against');
+  assert.ok(!unsized.some(u => /vas\.snssdk/.test(u)), 'the inline size must be known to compare against');
 });
 
 test('a chosen quality with no compatible stream at all says so instead of blaming the quality', async () => {
@@ -564,9 +566,9 @@ test('a nested answer is read for the asked episode only', async () => {
   const info = await getPlayInfo('9000000000000000201', '', { force: true });
   assert.equal(info.url, MEDIA.main720);
   assert.equal(info.contentKey, KEY);
-  const calls = requested.filter(u => /api5-normal/.test(u));
+  const calls = requested.filter(u => /api5-normal|reading\.snssdk\.com/.test(u));
   assert.equal(calls.length, 1, 'an answered request is not followed by another endpoint');
-  assert.equal(new URL(calls[0]).pathname, '/reading/bookapi/video_tab/multi_video_model/v1/');
+  assert.equal(new URL(calls[0]).pathname, '/novel/player/multi_video_model/preload/v1');
   nest = '1004';
   fake(answer({ '9000000000000000204': { video_model: { video_list: [stream] } } }));
   assert.equal((await getPlayInfo('9000000000000000204', '', { force: true })).url, MEDIA.main720);
@@ -680,5 +682,123 @@ test('business code 110001 asks once more with a new device; a timeout and other
   fake({ api: () => { calls++; throw new HttpError('网络连接失败', 0); } });
   await assert.rejects(fetchAppPlayUrl('9000000000000000416'), error => error.network === true);
   assert.equal(calls, 1);
+  setPlaybackPacing(0);
+});
+
+// Upstream 8.2: the current App's preload request, asked before the other endpoints.
+test('the preload request is a signed gzip POST for that episode with its own profile', () => {
+  const identity = { device_id: REGISTERED.device_id_str, iid: REGISTERED.install_id_str, cdid: '00000000-0000-4000-8000-000000000000' };
+  const signed = preloadRequest(identity, '9000000000000000099');
+  const url = new URL(signed.url);
+  assert.equal(signed.method, 'POST');
+  assert.equal(url.origin + url.pathname, 'https://reading.snssdk.com/novel/player/multi_video_model/preload/v1');
+  assert.deepEqual(Array.from(url.searchParams.keys()), ['aid', 'app_name', 'version_code', 'version_name', 'update_version_code',
+    'manifest_version_code', 'os', 'ssmix', 'channel', 'device_platform', 'device_type', 'device_brand', 'os_version', 'os_api',
+    'ac', 'language', 'host_abi', 'iid', 'cdid', 'device_id', '_rticket']);
+  assert.equal(url.searchParams.get('version_code'), '74532');
+  assert.equal(url.searchParams.get('device_id'), identity.device_id);
+  assert.equal(url.searchParams.get('iid'), identity.iid);
+  const body = JSON.parse(zlib.gunzipSync(Buffer.from(signed.body)).toString());
+  assert.equal(body.dr_scene, 'preload');
+  assert.equal(body.biz_param.device_level, 2);
+  assert.deepEqual(body.mixed_video_id_map, { 1004: ['9000000000000000099'] });
+  assert.deepEqual(Object.keys(signed.headers).sort(), ['Accept', 'Content-Encoding', 'Content-Type', 'x-helios', 'x-khronos', 'x-medusa', 'x-ss-stub']);
+  assert.equal(signed.headers['x-ss-stub'].toLowerCase(), createHash('md5').update(signed.body).digest('hex'));
+  const prefix = Buffer.from(signed.headers['x-medusa'], 'base64').subarray(0, 4);
+  assert.equal((prefix.readUInt32LE() ^ Number(signed.headers['x-khronos'])) >>> 0, 5, 'a v5 envelope');
+});
+
+// Upstream 8.2: the endpoint that last gave a usable model is asked first by later lookups.
+test('the endpoint that answered is asked first from then on', async () => {
+  setPlaybackPacing(0);
+  // Only the player endpoint answers.
+  const log = renewingTransport({ emptyFor: () => log.paths[log.paths.length - 1] !== PLAYER });
+  assert.equal((await fetchAppPlayUrl('9000000000000000501')).url, MEDIA.main720);
+  assert.deepEqual(log.paths, [PRELOAD, PRELOAD, TAB, TAB, PLAYER]);
+  assert.equal((await fetchAppPlayUrl('9000000000000000502')).url, MEDIA.main720);
+  assert.deepEqual(log.paths.slice(5), [PLAYER]);
+  assert.equal(log.registrations, 1);
+  // When it stops answering, the others are asked in their usual order after it.
+  const later = renewingTransport({ emptyFor: () => later.paths[later.paths.length - 1] !== TAB });
+  assert.equal((await fetchAppPlayUrl('9000000000000000503')).url, MEDIA.main720);
+  assert.deepEqual(later.paths, [PLAYER, PLAYER, PRELOAD, PRELOAD, TAB]);
+  assert.deepEqual(later.hosts, ['b', 'b', 'reading', 'reading', 'b']);
+  // An answer without a usable model does not move its endpoint to the front.
+  setPlaybackPacing(0);
+  fake({ api: url => ({ status: 200, url, header: () => null, data: JSON.stringify({ code: 0, data: {} }) }) });
+  await assert.rejects(fetchAppPlayUrl('9000000000000000504'), /未返回所选分集/);
+  const fresh = renewingTransport();
+  assert.equal((await fetchAppPlayUrl('9000000000000000505')).url, MEDIA.main720);
+  assert.deepEqual(fresh.paths, [PRELOAD]);
+  setPlaybackPacing(0);
+});
+
+// Upstream 8.2: an inline model with no stream the TV can use is asked again through its
+// fallback_api, for HEVC (codec_type=1) and then H.264 (codec_type=0&force_codec=h264).
+test('an inline model without a usable stream asks the fallback model for another codec', async () => {
+  const good = { codec_type: 'h264', definition: '1080p', main_url: MEDIA.main1080, vwidth: 1080, vheight: 1920, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } };
+  const inline = (vid, list, extra = {}) => ({ status: 200, header: () => null, data: JSON.stringify({ code: 0, data: { 1004: { [vid]: { video_model: Object.assign({
+    video_id: 'v0abc', video_duration: 61.2, fallback_api: 'https://vas.snssdk.com/video/fallback?a=1', video_list: list }, extra) } } } }) });
+  const run = async (vid, list, answer, options = {}, extra) => {
+    setPlaybackPacing(0);
+    const asked = [];
+    setTransport(async url => {
+      const reply = (status, data) => ({ status, data, url, header: n => (n === 'content-type' ? 'application/json' : null) });
+      if (/device_register/.test(url)) return reply(200, JSON.stringify(REGISTERED));
+      if (/vas\.snssdk\.com/.test(url)) { asked.push(new URL(url).search); return answer(new URL(url).searchParams, reply); }
+      if (/api5-normal|reading\.snssdk\.com/.test(url)) return Object.assign(inline(vid, list, extra), { url });
+      return reply(404, '');
+    });
+    return { asked, result: await fetchAppPlayUrl(vid, options).then(value => ({ value }), error => ({ error })) };
+  };
+  const model = list => JSON.stringify({ code: 0, video_info: { code: 0, data: { video_id: 'v0abc', video_duration: 61.3, video_list: list } } });
+  const byteVc2 = [{ codec_type: 'bytevc2', definition: '1080p', main_url: MEDIA.main1080, vwidth: 1080, vheight: 1920, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } }];
+
+  // The HEVC ask answers: one fallback request, with the address's own query kept.
+  let { asked, result } = await run('9000000000000000601', byteVc2, (q, reply) => reply(200, model([good])));
+  assert.equal(result.value.url, MEDIA.main1080);
+  assert.equal(result.value.contentKey, KEY);
+  assert.deepEqual(asked, ['?a=1&codec_type=1']);
+  // HEVC gives nothing usable: H.264 is asked next.
+  ({ asked, result } = await run('9000000000000000602', byteVc2, (q, reply) => reply(200, model(q.get('force_codec') === 'h264' ? [good] : byteVc2))));
+  assert.equal(result.value.url, MEDIA.main1080);
+  assert.deepEqual(asked, ['?a=1&codec_type=1', '?a=1&codec_type=0&force_codec=h264']);
+  // Neither helps, or the fallback is another video: the first error is reported.
+  ({ asked, result } = await run('9000000000000000603', byteVc2, (q, reply) => reply(200, model(byteVc2))));
+  assert.equal(result.error.code, 'UNSUPPORTED_CODEC');
+  assert.equal(asked.length, 2);
+  ({ result } = await run('9000000000000000604', byteVc2, (q, reply) => reply(200, JSON.stringify({ code: 0, video_info: { code: 0, data: { video_id: 'v0other', video_duration: 61.2, video_list: [good] } } }))));
+  assert.equal(result.error.code, 'UNSUPPORTED_CODEC');
+  ({ result } = await run('9000000000000000605', byteVc2, (q, reply) => reply(200, '{"code":1}')));
+  assert.equal(result.error.code, 'UNSUPPORTED_CODEC');
+  assert.ok(!result.error.rejected, 'a fallback that refuses a codec is not the App refusing the TV');
+  // A chosen quality the inline model lacks is looked for in the fallback model too, and is
+  // still never downgraded.
+  const only720 = [Object.assign({}, good, { definition: '720p', main_url: MEDIA.main720, vwidth: 720, vheight: 1280 })];
+  ({ result } = await run('9000000000000000606', only720, (q, reply) => reply(200, model([good])), { quality: '1080p' }));
+  assert.equal(result.value.url, MEDIA.main1080);
+  ({ asked, result } = await run('9000000000000000607', only720, (q, reply) => reply(200, model(only720)), { quality: '1080p' }));
+  assert.equal(result.error.code, 'QUALITY_UNAVAILABLE');
+  assert.equal(asked.length, 2);
+  // An HTTP refusal while asking is reported as such.
+  ({ asked, result } = await run('9000000000000000608', byteVc2, () => { throw new HttpError('HTTP 403', 403); }));
+  assert.equal(result.error.status, 403);
+  assert.equal(asked.length, 1);
+  // Without a video id and length to compare against, the fallback model is not asked.
+  ({ asked, result } = await run('9000000000000000609', byteVc2, (q, reply) => reply(200, model([good])), {}, { video_id: '' }));
+  assert.equal(result.error.code, 'UNSUPPORTED_CODEC');
+  assert.equal(asked.length, 0);
+  setPlaybackPacing(0);
+});
+
+// Upstream 8.2: a stream's `backup_url_1` is one of its addresses.
+test('backup_url_1 is used when the main address is not a media address', async () => {
+  setPlaybackPacing(0);
+  fake({ api: url => ({ status: 200, url, header: () => null, data: JSON.stringify({ code: 0, data: { 1004: { '9000000000000000701': { video_model: { video_list: [
+    { codec_type: 'h264', definition: '720p', main_url: 'https://127.0.0.1/private', backup_url_1: MEDIA.main720, vwidth: 720, vheight: 1280, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } },
+    { codec_type: 'h264', definition: '1080p', backup_url_1: MEDIA.main1080, vwidth: 1080, vheight: 1920, encrypt_info: { spade_a: spadeFor(KEY), encrypt: true } },
+  ] } } } } }) }) });
+  const info = await fetchAppPlayUrl('9000000000000000701');
+  assert.deepEqual(info.variants.map(v => v.url), [MEDIA.main1080, MEDIA.main720]);
   setPlaybackPacing(0);
 });
