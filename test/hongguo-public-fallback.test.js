@@ -23,7 +23,7 @@ function fake({ fallback, app = () => '' }) {
     }
     if (/hongguoduanju\.com/.test(url)) return reply(500, '');
     if (/device_register/.test(url)) return reply(200, JSON.stringify({ device_id_str: '4100000000000000001', install_id_str: '4100000000000000002' }));
-    if (/api5-normal/.test(url)) { log.push('app'); return reply(200, app(url)); }
+    if (/api5-normal|reading\.snssdk\.com/.test(url)) { log.push('app'); return reply(200, app(url)); }
     return reply(404, '');
   });
   return log;

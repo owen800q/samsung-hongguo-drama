@@ -157,7 +157,7 @@ try {
 
   // Fail the best App address: the player must fall back to the next one. Some episodes now
   // list a single usable address, so every stream gets a missing address in front to fail.
-  await page.route(/api5-normal/, async route => {
+  await page.route(/api5-normal|reading\.snssdk\.com/, async route => {
     const response = await route.fetch();
     let body = await response.text();
     try {
@@ -195,7 +195,7 @@ try {
   const sub = await page.textContent('.player-sub');
   check('player shows the episode', sub.includes('第 ' + target + ' 集'), sub);
   await page.unroute(/(qznovelvod|fqnovelvod|douyinvod)\.com/);
-  await page.unroute(/api5-normal/);
+  await page.unroute(/api5-normal|reading\.snssdk\.com/);
 
   // Leave: player → detail → home → exit dialog → exit.
   for (let i = 0; i < 6 && (await page.$('video.player-video, .detail')); i++) { await key(10009); await page.waitForTimeout(500); }
@@ -517,7 +517,7 @@ try {
   pub.on('pageerror', e => errors.push('public fallback page: ' + e));
   const pubOrder = [];
   const PUBLIC_MEDIA = 'https://v3-hgweb.qznovelvod.com/e2e-public/360p.mp4';
-  await pub.route(/api5-normal/, route => { pubOrder.push('app'); return route.fulfill({ status: 200, contentType: 'application/json', body: '' }); });
+  await pub.route(/api5-normal|reading\.snssdk\.com/, route => { pubOrder.push('app'); return route.fulfill({ status: 200, contentType: 'application/json', body: '' }); });
   await pub.route(/hongguoduanju\.com\/api\/video\/protected\/fallback-play-info/, route => {
     pubOrder.push('public');
     let asked = '';
@@ -592,7 +592,7 @@ try {
     const w = item.vwidth || item.width || meta.vwidth || meta.width; const h = item.vheight || item.height || meta.vheight || meta.height;
     streamIds.add((codec === 'bytevc1' || codec === 'h265' ? 'hevc' : codec) + '|' + (w && h ? Math.min(w, h) : item.definition || meta.definition));
   });
-  await swap.route(/api5-normal|vas\.snssdk\.com/, async route => {
+  await swap.route(/api5-normal|reading\.snssdk\.com|vas\.snssdk\.com/, async route => {
     const response = await route.fetch();
     const body = await response.text();
     try {
