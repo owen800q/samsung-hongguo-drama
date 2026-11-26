@@ -13,8 +13,9 @@
 // Upstream 8.0/8.1: one anonymous device is kept across lookups, and a lookup asks
 // video_tab, the player endpoint on both hosts, the single-episode model endpoint on two
 // more hosts and the older POST in turn, each once more after an empty answer. The device
-// is replaced, at most once per lookup, after business code 110001 or empty answers (see
-// fetchAppPlayUrl).
+// is replaced within a lookup, once, after business code 110001 (see fetchAppPlayUrl).
+// Upstream 8.3: after empty answers the lookup ends without a second round; the device is
+// replaced for later lookups once two have ended that way and 30 s have passed.
 // Upstream 8.2: the current App's preload endpoint is asked before all of those, the endpoint
 // that last gave a usable model is asked first from then on, and a model whose listed streams
 // the TV cannot use is asked again through its fallback_api for an HEVC or H.264 one.
@@ -308,11 +309,12 @@ export function fetchAppPlayUrl(vid, options = {}) {
       try {
         return await fetchAppPlayUrlFresh(vid, options);
       } catch (error) {
-        // Upstream 8.0/8.1: a lookup every endpoint answered empty, or that the App turned
-        // this device away from, is asked once more with a new device; after empty answers
-        // only when the device was not replaced in the last 30 s.
-        const empty = !!error && !!error.empty && !error.registration;
-        if (!turnedAway(error) && !(empty && Date.now() - deviceResetAt >= DEVICE_RESET_GAP_MS)) throw error;
+        // Upstream 7.7: a lookup the App turned this device away from (110001) is asked once
+        // more with a new device. Upstream 8.3: a lookup every endpoint answered empty ends
+        // there, so the website's public stream is tried without a second round (8.0/8.1
+        // asked it again with a new device); the device is still replaced for later lookups
+        // below.
+        if (!turnedAway(error)) throw error;
         replaceDevice();
         return await fetchAppPlayUrlFresh(vid, options);
       }

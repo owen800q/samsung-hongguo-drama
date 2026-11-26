@@ -376,24 +376,33 @@ test('an empty answer is asked once more, then on the next endpoint, all with th
   setPlaybackPacing(0);
 });
 
-test('a lookup answered empty everywhere is asked once more with a new device, at most every 30 s', async () => {
+// Upstream 8.3: a lookup every endpoint answered empty ends after one round, so the website's
+// public stream is not kept waiting behind a second one. The device is replaced for the
+// lookup after two such lookups, at most every 30 s.
+test('a lookup answered empty everywhere ends after one round; two of them replace the device, at most every 30 s', async () => {
   setPlaybackPacing(0);
   const now = Date.now;
   const log = renewingTransport({ emptyFor: () => true });
   try {
     await assert.rejects(getPlayInfo('9000000000000000022', '', { force: true }), /均未提供播放地址/);
-    assert.deepEqual(log.paths, ROUND.concat(ROUND));
-    assert.equal(log.registrations, 2);
-    assert.deepEqual(log.devices, new Array(14).fill('4200000000000000001').concat(new Array(14).fill('4200000000000000002')));
-    // Within 30 s the next lookups keep that device: one round each, no new registration.
+    assert.deepEqual(log.paths, ROUND);
+    assert.equal(log.registrations, 1);
+    // The second empty lookup still uses that device; the one after it registers a new one.
     await assert.rejects(fetchAppPlayUrl('9000000000000000023'), error => error.empty === true);
+    assert.equal(log.registrations, 1);
     await assert.rejects(fetchAppPlayUrl('9000000000000000024'), error => error.empty === true);
     assert.equal(log.registrations, 2);
-    assert.equal(log.paths.length, 56);
-    // After 30 s an empty lookup gets a new device again.
+    assert.deepEqual(log.devices, new Array(28).fill('4200000000000000001').concat(new Array(14).fill('4200000000000000002')));
+    // Within 30 s of that the device is kept, however many lookups come back empty.
+    await assert.rejects(fetchAppPlayUrl('9000000000000000028'), error => error.empty === true);
+    await assert.rejects(fetchAppPlayUrl('9000000000000000029'), error => error.empty === true);
+    assert.equal(log.registrations, 2);
+    assert.equal(log.paths.length, 70);
+    // After 30 s the next lookup gets a new device again.
     const later = now() + 31000;
     Date.now = () => later;
     await assert.rejects(fetchAppPlayUrl('9000000000000000025'), error => error.empty === true);
+    await assert.rejects(fetchAppPlayUrl('9000000000000000030'), error => error.empty === true);
     assert.equal(log.registrations, 3);
     assert.equal(log.devices[log.devices.length - 1], '4200000000000000003');
   } finally {
@@ -402,12 +411,15 @@ test('a lookup answered empty everywhere is asked once more with a new device, a
   }
 });
 
-test('the new device answers after the first one got empty answers', async () => {
+test('the new device answers after the first one got empty answers twice', async () => {
   setPlaybackPacing(0);
   const log = renewingTransport({ emptyFor: device => device === '4200000000000000001' });
+  await assert.rejects(fetchAppPlayUrl('9000000000000000026'), error => error.empty === true);
+  await assert.rejects(fetchAppPlayUrl('9000000000000000031'), error => error.empty === true);
+  assert.equal(log.registrations, 1);
   assert.equal((await fetchAppPlayUrl('9000000000000000026')).url, MEDIA.main720);
   assert.equal(log.registrations, 2);
-  assert.deepEqual(log.paths, ROUND.concat([PRELOAD]));
+  assert.deepEqual(log.paths, ROUND.concat(ROUND, [PRELOAD]));
   // The next lookup keeps the device that worked.
   assert.equal((await fetchAppPlayUrl('9000000000000000027')).url, MEDIA.main720);
   assert.equal(log.registrations, 2);
@@ -420,6 +432,9 @@ test('a refused registration of the new device stops the lookup and the ones que
   for (const refusal of refusals) {
     setPlaybackPacing(0);
     const log = renewingTransport({ emptyFor: () => true, registrationReply: n => (n === 2 ? refusal : null) });
+    // Two empty lookups make the next one register a new device, which is refused.
+    await assert.rejects(fetchAppPlayUrl('9000000000000000042'), error => error.empty === true);
+    await assert.rejects(fetchAppPlayUrl('9000000000000000043'), error => error.empty === true);
     const first = fetchAppPlayUrl('9000000000000000040').then(value => ({ value }), error => ({ error }));
     const queued = fetchAppPlayUrl('9000000000000000041').then(value => ({ value }), error => ({ error }));
     const failed = (await first).error;
@@ -427,7 +442,7 @@ test('a refused registration of the new device stops the lookup and the ones que
     assert.match(failed.message, /设备注册被拒绝/);
     assert.equal((await queued).error, failed, 'the queued lookup fails with the same refusal');
     assert.equal(log.registrations, 2, 'nothing registers after the refusal');
-    assert.deepEqual(log.paths, ROUND, 'nothing is asked without a device');
+    assert.deepEqual(log.paths, ROUND.concat(ROUND), 'nothing is asked without a device');
   }
   setPlaybackPacing(0);
 });
