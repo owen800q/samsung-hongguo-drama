@@ -1,8 +1,10 @@
-// 红果 via the official website (hongguoduanju.com). Player pages are server-rendered
-// and embed the full episode vid list plus clear MP4 links for the web-accessible range.
+// 红果 via the official website (hongguoduanju.com) and the App. Until November 2026 the
+// server-rendered player pages embedded the full episode vid list; they now list only the
+// few public episodes, under opaque `v1_...` ids, so the list comes from the App's detail
+// endpoint and the page adds tags and the public range (upstream 8.5).
 import { CancelToken, getJson, getText, request, memo, withQuery } from '../lib/http.js';
 import { decodeHtml, httpsUrl, isPublicMediaUrl, readRouterData, uniqueBy } from './util.js';
-import { fetchAppPlayUrl } from './app-source.js';
+import { fetchAppPlayUrl, fetchAppEpisodeList } from './app-source.js';
 
 const SITE = 'https://hongguoduanju.com';
 const episodesCache = memo(60000, 32);
@@ -21,7 +23,13 @@ function fetchSiteHtml(url, options = {}) {
   return getText(url, Object.assign({ timeout: 20000 }, options, { headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' } }));
 }
 
-/** The series in a player or detail page → episode list; throws when the page is not this series. */
+const PUBLIC_TOKEN = /^v\d+_[A-Za-z0-9_-]{8,128}$/;
+
+/**
+ * The series in a player or detail page → episode list; throws when the page is not this
+ * series. A page that lists only its public episodes (fewer than the series has, or under
+ * opaque `v1_...` ids) gives `complete: false`, no `episodes`, and those ids as `public_tokens`.
+ */
 export function parseEpisodeListHtml(html, seriesId) {
   const loader = readRouterData(html).loaderData || {};
   const data = loader['player_(series_id)/page'] || loader['player_(series_id)/(vid)/page'] || loader.detail_page;
@@ -33,8 +41,11 @@ export function parseEpisodeListHtml(html, seriesId) {
   }
   if (!Array.isArray(detail.vid_list)) throw new Error('红果官网未返回分集数据，请稍后重试');
   const vids = detail.vid_list.map(String);
-  if (vids.some(v => !/^\d{1,30}$/.test(v)) || new Set(vids).size !== vids.length) throw new Error('红果分集数据异常，请稍后重试');
+  const opaque = vids.length > 0 && vids.every(v => PUBLIC_TOKEN.test(v));
+  if ((!opaque && vids.some(v => !/^\d{1,30}$/.test(v))) || new Set(vids).size !== vids.length) throw new Error('红果分集数据异常，请稍后重试');
   if (!vids.length) throw new Error('红果分集列表为空');
+  const count = Number(detail.episode_cnt) || Number(detail.series_episode_info && detail.series_episode_info.episode_cnt) || null;
+  const complete = !opaque && (count == null || vids.length >= count);
   const text = value => typeof value === 'string' ? value : '';
   const accessible = /^\d+$/.test(String(detail.accessible_episode_cnt)) ? Math.min(Number(detail.accessible_episode_cnt), vids.length) : null;
   return {
@@ -43,10 +54,12 @@ export function parseEpisodeListHtml(html, seriesId) {
     cover: text(detail.series_cover),
     intro: text(detail.series_intro),
     tags: Array.isArray(detail.tags) ? detail.tags.filter(t => typeof t === 'string').slice(0, 6) : [],
-    total: vids.length,
+    total: complete ? vids.length : count || vids.length,
     web_accessible_episodes: accessible,
+    complete,
+    public_tokens: opaque ? vids : [],
     // Episodes past the web range are still attempted through the App source.
-    episodes: vids.map((vid, i) => ({ vid, vid_index: i + 1, title: '', locked: false })),
+    episodes: complete ? vids.map((vid, i) => ({ vid, vid_index: i + 1, title: '', locked: false })) : [],
     source: 'hongguo',
   };
 }
@@ -122,8 +135,64 @@ function fetchEpisodeListFromWeb(seriesId, { hedgeMs = EPISODE_HEDGE_MS, budget 
   });
 }
 
+// How long a finished App list waits for the website's page (tags, public range).
+export const WEB_DETAILS_GRACE_MS = 2500;
+
+function describeAppListError(error) {
+  if (error && error.network) return error.timedOut ? '请求超时' : '网络连接失败';
+  if (error && (error.registration || error.registrationFailure)) return '匿名设备登记失败';
+  if (error && error.empty) return '接口返回空响应';
+  if (error && (error.rejected || error.businessCode)) return '接口暂时拒绝请求';
+  return (error && /^App /.test(error.message || '') && error.message) || '暂不可用';
+}
+
+/**
+ * Upstream 8.5: the App's detail endpoint gives the whole list; the website's page, asked at
+ * the same time, adds tags and how many episodes are public. When the App fails, a page that
+ * still lists every episode is used; one that lists only its public episodes is not a list.
+ */
+async function fetchEpisodeListFresh(seriesId, options) {
+  const settled = promise => promise.then(value => ({ value }), error => ({ error }));
+  const webPending = settled(fetchEpisodeListFromWeb(seriesId, options));
+  const app = await settled(fetchAppEpisodeList(seriesId, { timeout: options.appTimeout }));
+  if (app.error) {
+    const web = await webPending;
+    if (web.error) throw web.error;
+    if (web.value.complete) return web.value;
+    throw new Error('红果官网只列出公开的前几集，完整分集来自 App 接口（' + describeAppListError(app.error) + '），请稍后重试');
+  }
+  const grace = options.webGrace == null ? WEB_DETAILS_GRACE_MS : options.webGrace;
+  const web = (await Promise.race([webPending, new Promise(resolve => setTimeout(resolve, grace, {}))])).value;
+  const list = app.value;
+  // The App repeats the series introduction as every episode's title.
+  list.episodes.forEach(episode => { if (episode.title === list.intro) episode.title = ''; });
+  return {
+    series_id: list.series_id,
+    series_title: (web && web.series_title !== '未命名短剧' && web.series_title) || list.series_title,
+    cover: (web && web.cover) || list.cover,
+    intro: list.intro || (web && web.intro) || '',
+    tags: web ? web.tags : [],
+    total: list.total,
+    web_accessible_episodes: web && web.web_accessible_episodes != null ? Math.min(web.web_accessible_episodes, list.total) : null,
+    complete: true,
+    public_tokens: web ? web.public_tokens : [],
+    episodes: list.episodes,
+    source: 'hongguo',
+  };
+}
+
 export function fetchEpisodeList(seriesId, options = {}) {
-  return episodesCache('episodes:' + seriesId, () => fetchEpisodeListFromWeb(String(seriesId), options), options.force);
+  return episodesCache('episodes:' + seriesId, () => fetchEpisodeListFresh(String(seriesId), options), options.force);
+}
+
+// Upstream 8.5: the public stream endpoint only knows the page's opaque ids, which are
+// listed in episode order.
+const tokensCache = memo(300000, 32);
+function fetchPublicTokens(sid) {
+  return tokensCache('tokens:' + sid, async () => {
+    const page = parseEpisodeListHtml(await fetchSiteHtml(SITE + '/player/' + encodeURIComponent(sid), { timeout: 4000 }), sid);
+    return page.public_tokens;
+  });
 }
 
 /**
@@ -173,13 +242,15 @@ function mediaUrl(value) {
   } catch (_) { return ''; }
 }
 
-async function fetchPlayUrlFromWeb(vid, sid) {
+/** `pageId` is what the site calls the episode: `vid`, or since upstream 8.5 its opaque id. */
+async function fetchPlayUrlFromWeb(vid, sid, pageId = vid) {
   const candidates = [];
-  if (sid) candidates.push(SITE + '/player/' + encodeURIComponent(sid) + '/' + encodeURIComponent(vid));
-  candidates.push(SITE + '/player/_/' + encodeURIComponent(vid));
+  if (sid) candidates.push(SITE + '/player/' + encodeURIComponent(sid) + '/' + encodeURIComponent(pageId));
+  // An opaque id belongs to its series; only a numeric one has a page of its own.
+  if (pageId === vid) candidates.push(SITE + '/player/_/' + encodeURIComponent(vid));
   for (const url of candidates) {
     try {
-      const videoUrl = pickWebMedia(await fetchSiteHtml(url), vid, sid);
+      const videoUrl = pickWebMedia(await fetchSiteHtml(url), pageId, sid);
       if (videoUrl) return { url: videoUrl, contentKey: null, codec: '', quality: '', source: 'web', vid: String(vid) };
     } catch (_) { /* try the next form, then the App source */ }
   }
@@ -194,18 +265,21 @@ const PUBLIC_FALLBACK_API = SITE + '/api/video/protected/fallback-play-info';
 
 /**
  * The website's public stream for `vid`, or null when the answer is unusable. Rejects with
- * `publicLimited` when the site does not offer the episode publicly (HTTP 403).
+ * `publicLimited` when the site does not offer the episode publicly (HTTP 403 or 400).
+ * Upstream 8.5: `token` is the page's opaque id of this episode, asked for in place of `vid`.
  */
-export async function fetchPublicFallbackPlayUrl(vid) {
+export async function fetchPublicFallbackPlayUrl(vid, token) {
   if (!/^\d{1,30}$/.test(String(vid))) return null;
+  if (token != null && !PUBLIC_TOKEN.test(String(token))) return null;
   let payload;
   try {
     payload = await getJson(PUBLIC_FALLBACK_API, {
       method: 'POST', timeout: 6000, headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ item_id: String(vid) }),
+      body: JSON.stringify({ item_id: String(token == null ? vid : token) }),
     });
   } catch (error) {
-    if (error && error.status === 403) throw Object.assign(new Error('官网公开片源不提供本集'), { publicLimited: true });
+    // 403: not public. 400 (since November 2026): the site no longer accepts this id.
+    if (error && (error.status === 403 || error.status === 400)) throw Object.assign(new Error('官网公开片源不提供本集'), { publicLimited: true });
     throw error;
   }
   if (!payload || typeof payload !== 'object') return null;
@@ -241,8 +315,12 @@ async function fetchPlayInfoFresh(vid, sid, skipWeb) {
   const index = series ? series.episodes.findIndex(e => e.vid === String(vid)) : -1;
   const accessible = series ? series.web_accessible_episodes : null;
   const inWebRange = !(typeof accessible === 'number' && index >= accessible);
-  if (inWebRange && !skipWeb) {
-    const web = await fetchPlayUrlFromWeb(vid, sid);
+  // Upstream 8.5: where the site lists opaque ids, its pages and its public stream go by
+  // them, in episode order; an episode past the listed ones has no page.
+  let tokens = (series && series.public_tokens) || [];
+  const pageId = () => tokens.length ? tokens[index] : vid;
+  if (inWebRange && !skipWeb && pageId()) {
+    const web = await fetchPlayUrlFromWeb(vid, sid, pageId());
     if (web) return web;
   }
   let appError = null;
@@ -250,8 +328,8 @@ async function fetchPlayInfoFresh(vid, sid, skipWeb) {
     return await fetchAppPlayUrl(String(vid));
   } catch (error) { appError = error; /* fall through to an explanatory error */ }
   // A CDN hiccup changes the order of the sources, not whether the website has the episode.
-  if (inWebRange && skipWeb) {
-    const web = await fetchPlayUrlFromWeb(vid, sid);
+  if (inWebRange && skipWeb && pageId()) {
+    const web = await fetchPlayUrlFromWeb(vid, sid, pageId());
     if (web) return web;
   }
   // Upstream 8.0/8.1: when the App gave nothing, the website's public 360P stream of the
@@ -259,7 +337,9 @@ async function fetchPlayInfoFresh(vid, sid, skipWeb) {
   // better App stream. An episode that only exists as ByteVC2 may still play this way.
   let publicLimited = false;
   try {
-    const fallback = await fetchPublicFallbackPlayUrl(vid);
+    // The list may have come without the page's ids (website slow or down at the time).
+    if (!tokens.length && sid && index >= 0 && index < 10) { try { tokens = await fetchPublicTokens(sid); } catch (_) {} }
+    const fallback = await fetchPublicFallbackPlayUrl(vid, (index >= 0 && tokens[index]) || null);
     if (fallback) return fallback;
   } catch (error) { publicLimited = !!(error && error.publicLimited); }
   if (appError && appError.network) throw new Error('网络连接失败，未能获取播放地址，请检查电视网络后重试');

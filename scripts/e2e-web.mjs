@@ -3,11 +3,15 @@
 // access whitelist), and remote key codes, against the live sources.
 // Usage: npm run build && npx vite preview --port 4173 & npm run e2e -- http://localhost:4173/
 // Needs ffmpeg (for a VP9 stand-in clip) and Chromium (CHROMIUM_PATH, default Playwright's).
+// Since November 2026 the App answers playback lookups with empty bodies: the checks that
+// follow an App stream then run on a stand-in answer and stream (e2e-app-fixture.mjs), and
+// say so in their output. A live answer is used whenever there is one.
 import { chromium } from 'playwright-core';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { APP_PLAYBACK, routeAppPlayback } from './e2e-app-fixture.mjs';
 
 const URL_ = process.argv[2] || 'http://localhost:4173/';
 const TV_UA = 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/537.36 (KHTML, like Gecko) 76.0.3809.146/6.0 TV Safari/537.36';
@@ -74,6 +78,19 @@ if (!fs.existsSync(clipPath)) {
     '-c:v', 'libvpx-vp9', '-b:v', '200k', '-deadline', 'realtime', '-cpu-used', '8', clipPath]);
 }
 const clip = fs.readFileSync(clipPath);
+const serveClip = hits => route => {
+  if (hits) hits.push(route.request().url());
+  const m = /bytes=(\d+)-(\d*)/.exec(route.request().headers().range || '');
+  if (!m) return route.fulfill({ status: 200, contentType: 'video/webm', headers: { 'accept-ranges': 'bytes' }, body: clip });
+  const start = Number(m[1]); const end = m[2] ? Number(m[2]) : clip.length - 1;
+  return route.fulfill({ status: 206, contentType: 'video/webm', body: clip.subarray(start, end + 1),
+    headers: { 'accept-ranges': 'bytes', 'content-range': `bytes ${start}-${end}/${clip.length}` } });
+};
+// Upstream 8.5: the site's episode pages go by opaque ids (/player/<series>/v1_...).
+const EPISODE_PAGE = /hongguoduanju\.com\/player\/\d+\/v\d+_[\w-]+/;
+// The CDN of the website's public stream (the whole episode, clear H.264).
+const PUBLIC_STREAM = /-hgweb\.[a-z]+\.com\//;
+const usedApp = used => used.length ? '  App answers: ' + Array.from(new Set(used)).join(' + ') : '';
 const webMedia = [];
 await page.route(/hongguoduanju\.com\/video\//, route => {
   webMedia.push(route.request().url());
@@ -84,9 +101,12 @@ await page.route(/hongguoduanju\.com\/video\//, route => {
     headers: { 'accept-ranges': 'bytes', 'content-range': `bytes ${start}-${end}/${clip.length}` } });
 });
 
+// An episode whose page offers no file plays the website's public stream instead.
+await page.route(PUBLIC_STREAM, serveClip(webMedia));
+
 // Protected 红果 pages only expose a preview, so the player skips them. The main run needs a
 // website episode to drive, so its pages are unprotected; a separate page checks the fallback.
-await page.route(/hongguoduanju\.com\/player\/[^?]*\/\d+/, async route => {
+await page.route(EPISODE_PAGE, async route => {
   try {
     const res = await route.fetch();
     await route.fulfill({ response: res, body: (await res.text()).replace(/"protectedPlayback":true/g, '"protectedPlayback":false') });
@@ -157,9 +177,7 @@ try {
 
   // Fail the best App address: the player must fall back to the next one. Some episodes now
   // list a single usable address, so every stream gets a missing address in front to fail.
-  await page.route(/api5-normal|reading\.snssdk\.com/, async route => {
-    const response = await route.fetch();
-    let body = await response.text();
+  const mainApp = await routeAppPlayback(page, { mutate: body => {
     try {
       const json = JSON.parse(body);
       // The player endpoint nests the models under "1004" and may key the streams by name.
@@ -174,28 +192,27 @@ try {
         });
         entry.video_model = typeof entry.video_model === 'string' ? JSON.stringify(model) : model;
       });
-      body = JSON.stringify(json);
-    } catch (_) { /* not a playback answer */ }
-    return route.fulfill({ response, body });
-  });
+      return JSON.stringify(json);
+    } catch (_) { return body; /* not a playback answer */ }
+  } });
   const mediaHits = [];
   let failed = false;
   await page.route(/(qznovelvod|fqnovelvod|douyinvod)\.com/, async route => {
     mediaHits.push(route.request().url().split('?')[0]);
     if (!failed) { failed = true; return route.fulfill({ status: 404, body: '' }); }
-    return route.continue();
+    return route.fallback();
   });
   await key(13);
   // The decrypted HEVC cannot be decoded here, so check the pipeline up to the <video>.
   const end = Date.now() + 120000;
   let src = '';
   while (Date.now() < end && !/^blob:/.test(src)) { await page.waitForTimeout(500); src = ((await videoState()) || {}).src || ''; }
-  check('encrypted episode is downloaded, decrypted and handed to the player', /^blob:/.test(src), src);
+  check('encrypted episode is downloaded, decrypted and handed to the player', /^blob:/.test(src), src + usedApp(mainApp));
   check('after the first App address fails the next one is used', mediaHits.length >= 2 && mediaHits[0] !== mediaHits[1], mediaHits.slice(0, 3).join(' , '));
   const sub = await page.textContent('.player-sub');
   check('player shows the episode', sub.includes('第 ' + target + ' 集'), sub);
   await page.unroute(/(qznovelvod|fqnovelvod|douyinvod)\.com/);
-  await page.unroute(/api5-normal|reading\.snssdk\.com/);
+  await page.unroute(APP_PLAYBACK);
 
   // Leave: player → detail → home → exit dialog → exit.
   for (let i = 0; i < 6 && (await page.$('video.player-video, .detail')); i++) { await key(10009); await page.waitForTimeout(500); }
@@ -483,7 +500,7 @@ try {
   await prot.route(/hongguoduanju\.com\/video\//, route => { protMedia.push(route.request().url()); return route.abort(); });
   // This check is about the App source; the website's public stream has its own below.
   await prot.route(/fallback-play-info/, route => route.fulfill({ status: 403, contentType: 'application/json', body: '{"error":"public_fallback_unavailable"}' }));
-  await prot.route(/hongguoduanju\.com\/player\/[^?]*\/\d+/, async route => {
+  await prot.route(EPISODE_PAGE, async route => {
     try {
       const res = await route.fetch();
       const body = (await res.text()).replace(/"protectedPlayback":(true|false),?/g, '').replace(/"publicVideoSeo":/g, '"protectedPlayback":true,"publicVideoSeo":');
@@ -491,6 +508,7 @@ try {
       await route.fulfill({ response: res, body });
     } catch (_) { /* a next-episode prefetch still in flight when the page closes */ }
   });
+  const protApp = await routeAppPlayback(prot);
   await prot.goto(URL_);
   await prot.waitForSelector('.poster.focusable', { timeout: 30000 });
   await prot.evaluate(() => document.querySelector('.poster.focusable').focus());
@@ -506,7 +524,7 @@ try {
     if (await prot.$('.player-error')) break;
   }
   const protError = await prot.evaluate(() => ((document.querySelector('.player-error') || {}).textContent || '').trim());
-  check('a protected preview page falls back to the App source', protPages > 0 && /^blob:/.test(protSrc) && protMedia.length === 0, protSrc + ' protected pages: ' + protPages + ', web hits: ' + protMedia.length + (protError ? ', error: ' + protError.slice(0, 120) : ''));
+  check('a protected preview page falls back to the App source', protPages > 0 && /^blob:/.test(protSrc) && protMedia.length === 0, protSrc + ' protected pages: ' + protPages + ', web hits: ' + protMedia.length + (protError ? ', error: ' + protError.slice(0, 120) : '') + usedApp(protApp));
   await prot.close();
 
   // Upstream 8.0: every App endpoint answers empty (as the platform did in November 2026):
@@ -517,12 +535,13 @@ try {
   pub.on('pageerror', e => errors.push('public fallback page: ' + e));
   const pubOrder = [];
   const PUBLIC_MEDIA = 'https://v3-hgweb.qznovelvod.com/e2e-public/360p.mp4';
-  await pub.route(/api5-normal|reading\.snssdk\.com/, route => { pubOrder.push('app'); return route.fulfill({ status: 200, contentType: 'application/json', body: '' }); });
+  await pub.route(APP_PLAYBACK, route => { pubOrder.push('app'); return route.fulfill({ status: 200, contentType: 'application/json', body: '' }); });
   await pub.route(/hongguoduanju\.com\/api\/video\/protected\/fallback-play-info/, route => {
     pubOrder.push('public');
     let asked = '';
     try { asked = String(JSON.parse(route.request().postData() || '{}').item_id || ''); } catch (_) {}
-    if (!/^\d+$/.test(asked) || route.request().method() !== 'POST') return route.fulfill({ status: 400, body: '' });
+    // Upstream 8.5: the endpoint goes by the page's opaque id of the episode, not its number.
+    if (!/^v\d+_[\w-]{8,}$/.test(asked) || route.request().method() !== 'POST') return route.fulfill({ status: 400, body: '' });
     return route.fulfill({ status: 200, contentType: 'application/json',
       body: JSON.stringify({ main_url: PUBLIC_MEDIA, url_expire: Math.floor(Date.now() / 1000) + 3600, base_resp: { StatusCode: 0, StatusMessage: '' } }) });
   });
@@ -535,7 +554,7 @@ try {
   });
   const pubPreview = [];
   await pub.route(/hongguoduanju\.com\/video\//, route => { pubPreview.push(route.request().url()); return route.abort(); });
-  await pub.route(/hongguoduanju\.com\/player\/[^?]*\/\d+/, async route => {
+  await pub.route(EPISODE_PAGE, async route => {
     try {
       const res = await route.fetch();
       const body = (await res.text()).replace(/"protectedPlayback":(true|false),?/g, '').replace(/"publicVideoSeo":/g, '"protectedPlayback":true,"publicVideoSeo":');
@@ -577,7 +596,10 @@ try {
     document.addEventListener('loadstart', e => { delete e.target.error; }, true);
     document.addEventListener('loadedmetadata', e => {
       const v = e.target;
-      if (v.tagName !== 'VIDEO' || !/^blob:/.test(v.currentSrc) || v.videoWidth) return;
+      if (v.tagName !== 'VIDEO' || !/^blob:/.test(v.currentSrc)) return;
+      // A swap can be over between two looks at the page, so every decrypted stream is noted here.
+      (window.__blobs = window.__blobs || []).push(v.currentSrc);
+      if (v.videoWidth) return;
       v.pause();
       Object.defineProperty(v, 'error', { configurable: true, get: () => ({ code: 3 }) });
       v.dispatchEvent(new Event('error'));
@@ -592,9 +614,7 @@ try {
     const w = item.vwidth || item.width || meta.vwidth || meta.width; const h = item.vheight || item.height || meta.vheight || meta.height;
     streamIds.add((codec === 'bytevc1' || codec === 'h265' ? 'hevc' : codec) + '|' + (w && h ? Math.min(w, h) : item.definition || meta.definition));
   });
-  await swap.route(/api5-normal|reading\.snssdk\.com|vas\.snssdk\.com/, async route => {
-    const response = await route.fetch();
-    const body = await response.text();
+  const countAnswer = body => {
     try {
       const json = JSON.parse(body);
       Object.values((json.data && (json.data['1004'] || json.data.video_model_data)) || json.data || {}).forEach(entry => {
@@ -603,12 +623,17 @@ try {
       });
       if (json.video_info && json.video_info.data) countStreams(json.video_info.data.video_list);
     } catch (_) { /* not a playback answer */ }
-    return route.fulfill({ response, body });
+    return body;
+  };
+  const swapApp = await routeAppPlayback(swap, { mutate: countAnswer });
+  await swap.route(/vas\.snssdk\.com/, async route => {
+    const response = await route.fetch();
+    return route.fulfill({ response, body: countAnswer(await response.text()) });
   });
   await swap.route(/hongguoduanju\.com\/video\//, route => route.abort());
   // Only App streams are swapped; without this the website's public stream would play instead.
   await swap.route(/fallback-play-info/, route => route.fulfill({ status: 403, contentType: 'application/json', body: '{"error":"public_fallback_unavailable"}' }));
-  await swap.route(/hongguoduanju\.com\/player\/[^?]*\/\d+/, async route => {
+  await swap.route(EPISODE_PAGE, async route => {
     try {
       const res = await route.fetch();
       const body = (await res.text()).replace(/"protectedPlayback":(true|false),?/g, '').replace(/"publicVideoSeo":/g, '"protectedPlayback":true,"publicVideoSeo":');
@@ -636,6 +661,7 @@ try {
     if (/换用其他清晰度/.test(st.loading)) switchLabel = true;
     if (st.error) break;
   }
+  (await swap.evaluate(() => window.__blobs || [])).forEach(src => blobs.add(src));
   const swapError = await swap.evaluate(() => {
     const e = document.querySelector('.player-error');
     const r = e && e.getBoundingClientRect();
@@ -645,7 +671,7 @@ try {
   const expectedTries = Math.min(streamIds.size, 3);
   check('an undecodable App stream is swapped for the next one, at most twice, then 重试 is focused',
     streamIds.size > 0 && blobs.size === expectedTries && (expectedTries < 2 || switchLabel) && !!swapError && /无法解码/.test(swapError.text) && swapError.focused === '重试' && swapError.fits,
-    JSON.stringify({ streams: Array.from(streamIds), played: blobs.size, switchLabel, error: swapError }));
+    JSON.stringify({ streams: Array.from(streamIds), played: blobs.size, switchLabel, error: swapError }) + usedApp(swapApp));
   await swap.close();
 
   // 设置 → 河马来源 off: 发现 and 搜索 no longer offer it; 红果 has no switch.
@@ -702,14 +728,15 @@ try {
     return route.fulfill({ status: 206, contentType: 'video/webm', body: clip.subarray(start, end + 1),
       headers: { 'accept-ranges': 'bytes', 'content-range': `bytes ${start}-${end}/${clip.length}` } });
   });
-  // Episode pages by vid: the first one plays; the second fails (website, App and the
+  await pre.route(PUBLIC_STREAM, serveClip());
+  // Episode pages by the site's id: the first one plays; the second fails (website, App and the
   // website's public stream) for 5 s.
   const vids = [];
   const nextHits = [];
   const nextEnds = [];
   let blockUntil = 0;
-  await pre.route(/hongguoduanju\.com\/player\/[^?]*\/\d+/, async route => {
-    const vid = /\/(\d+)(?:\?|$)/.exec(route.request().url())[1];
+  await pre.route(EPISODE_PAGE, async route => {
+    const vid = /\/(v\d+_[\w-]+)(?:\?|$)/.exec(route.request().url())[1];
     if (vids.indexOf(vid) < 0) vids.push(vid);
     const hit = vids.indexOf(vid) === 1 ? nextHits.push(Date.now()) - 1 : -1;
     if (hit >= 0) {
@@ -777,10 +804,11 @@ try {
   await bare.addInitScript(() => { window.tizen = { tvinputdevice: { registerKey() {} } }; });
   bare.on('pageerror', e => errors.push('coverless detail page: ' + e));
   let stripped = 0;
-  await bare.route(/hongguoduanju\.com\/(player\/\d+$|detail\?series_id=\d+)/, async route => {
+  // Upstream 8.5: the App's detail answer (the episode list) carries covers too.
+  await bare.route(/hongguoduanju\.com\/(player\/\d+$|detail\?series_id=\d+)|\/novel\/player\/video_detail\//, async route => {
     try {
       const res = await route.fetch();
-      const body = (await res.text()).replace(/(\\?"series_cover\\?"\s*:\s*\\?")(?:[^"\\]|\\u[0-9a-fA-F]{4}|\\\/)*/g, (m, head) => { stripped++; return head; });
+      const body = (await res.text()).replace(/(\\?"(?:series_cover|cover_url)\\?"\s*:\s*\\?")(?:[^"\\]|\\u[0-9a-fA-F]{4}|\\\/)*/g, (m, head) => { stripped++; return head; });
       await route.fulfill({ response: res, body });
     } catch (_) { await route.abort().catch(() => {}); }
   });
