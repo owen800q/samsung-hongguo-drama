@@ -17,6 +17,8 @@ function stub(handler) {
   const calls = [];
   setTransport(async (url, options) => {
     const u = new URL(url);
+    // The App's device registration and detail endpoint are not part of these tests.
+    if (/snssdk\.com$|fqnovel\.com$/.test(u.hostname)) return { status: 503, data: '', url, header: () => null };
     calls.push(u);
     const res = await handler(u, options);
     return { status: res.status || 200, data: typeof res.data === 'string' ? res.data : JSON.stringify(res.data), url, header: () => null };
@@ -156,7 +158,7 @@ test('later pages only ask the sources that have more, and keep a failed source 
   assert.deepEqual(failed.more, ['hongguo'], 'the failed page can be asked again');
 });
 
-test('the episode list comes from the current player object and must name the requested series', async () => {
+test('with the App detail endpoint down, the episode list comes from the current player object and must name the requested series', async () => {
   const SID = '7673067074104593432';
   const html = model => '<script>window._ROUTER_DATA = ' + JSON.stringify({ loaderData: { 'player_(series_id)/page': model } }) + ';</script>' +
     // A recommendation further down the page must never be read as this series.
