@@ -20,6 +20,8 @@
 // that last gave a usable model is asked first from then on, and a model whose listed streams
 // the TV cannot use is asked again through its fallback_api for an HEVC or H.264 one.
 // Lookups take turns, one second apart (upstream 6.9).
+// Upstream 8.5: the App's video_detail endpoint lists every episode of a series
+// (fetchAppEpisodeList), since the website only lists the few it shows publicly.
 // SDK protocol constants below are not user credentials.
 import { request } from '../lib/http.js';
 import { getPlaybackDevice, resetPlaybackDevice } from './playback-device.js';
@@ -33,6 +35,8 @@ const PLAYER_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/mul
 const VIDEO_TAB_API = 'https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/';
 // Upstream 8.2: the current App's preload endpoint, asked first.
 const PRELOAD_API = 'https://reading.snssdk.com/novel/player/multi_video_model/preload/v1';
+// Upstream 8.5: a series' full episode list.
+const VIDEO_DETAIL_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/video_detail/v1/';
 // Upstream 8.0: the single-episode model endpoint, on two further official hosts.
 const MODEL_APIS = [
   'https://api5-normal-sinfonlinea.fqnovel.com/novel/player/video_model/v1/',
@@ -152,6 +156,23 @@ export function preloadRequest(identity, videoId) {
     headers: Object.assign({}, signed.headers, { Accept: 'application/json', 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip' }),
   };
 }
+// Upstream 8.5: the App's detail request for one series, signed and sent like the preload request.
+export function videoDetailRequest(identity, seriesId) {
+  const body = gzipStored(utf8(JSON.stringify({
+    series_id: String(seriesId),
+    biz_param: { caller_scene: 'single_col', detail_page_version: 0, from_video_id: '',
+      need_all_video_definition: false, need_mp4_align: false, source: 4, video_id_type: 1 },
+  })));
+  const signed = signPlaybackV5({
+    base: VIDEO_DETAIL_API,
+    values: Object.assign({}, PRELOAD_PROFILE, { iid: identity.iid, cdid: identity.cdid, device_id: identity.device_id }),
+    body, now: Date.now(), field21: 312,
+  });
+  return {
+    url: signed.url, body, method: 'POST',
+    headers: Object.assign({}, signed.headers, { Accept: 'application/json', 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip' }),
+  };
+}
 // Upstream 7.7: the video_tab GET for one episode. Signed like the player endpoint, with
 // the digest of an empty body and none of the headers that describe a body; the older
 // Argus/Ladon headers get an empty answer here.
@@ -217,7 +238,11 @@ function checkedUrl(value, domains) {
   }
   return url.href;
 }
-async function requestJson(url, options, deadline) {
+/** Series and episode ids exceed 2^53: quote them before JSON.parse rounds them (upstream 8.5). */
+export function preserveLargeJsonIntegers(raw, fields) {
+  return raw.replace(new RegExp('("(?:' + fields.join('|') + ')"\\s*:\\s*)(-?\\d{16,})(?=\\s*[,}\\]])', 'g'), '$1"$2"');
+}
+async function requestJson(url, options, deadline, preserve) {
   url = checkedUrl(url, ['fqnovel.com', 'snssdk.com']);
   const timeout = deadline - Date.now();
   if (timeout <= 0) throw Object.assign(new Error('App 片源请求超时'), { network: true, timedOut: true });
@@ -233,7 +258,7 @@ async function requestJson(url, options, deadline) {
   // XHR follows redirects itself; make sure we still ended on an allowed host.
   if (res.url) checkedUrl(res.url, ['fqnovel.com', 'snssdk.com']);
   if (typeof res.data === 'string' && !res.data.trim()) throw Object.assign(new Error('App 接口返回空响应（HTTP 200），原因尚未确认'), { empty: true });
-  const parsed = typeof res.data === 'string' ? jsonBody(res.data) : res.data;
+  const parsed = typeof res.data === 'string' ? jsonBody(preserve ? preserveLargeJsonIntegers(res.data, preserve) : res.data) : res.data;
   if (!parsed || typeof parsed !== 'object') throw new Error('App 接口未返回有效数据');
   return parsed;
 }
@@ -290,6 +315,49 @@ function replaceDevice() {
   resetPlaybackDevice();
   deviceResetAt = Date.now();
   emptyLookups = 0;
+}
+
+/**
+ * Upstream 8.5: every episode of a series from the App's detail endpoint, with the shared
+ * anonymous device. Rejects unless the answer is this series and lists all of its episodes.
+ * A device the App turns away (110001) is replaced and the request sent once more.
+ */
+export async function fetchAppEpisodeList(seriesId, options = {}) {
+  const sid = String(seriesId || '');
+  if (!/^\d{1,30}$/.test(sid)) throw new Error('红果剧集编号无效');
+  const deadline = Date.now() + (options.timeout || 9000);
+  const ask = async () => {
+    const identity = await getPlaybackDevice(requestJson);
+    const req = videoDetailRequest(identity, sid);
+    return requestJson(req.url, { method: 'POST', headers: req.headers, body: req.body }, deadline, ['series_id', 'vid']);
+  };
+  let response = await ask();
+  if (Number(response.code) === DEVICE_TURNED_AWAY) {
+    replaceDevice();
+    response = await ask();
+  }
+  if (Number(response.code) !== 0) throw new Error('App 详情接口拒绝请求');
+  const data = response.data && response.data.video_data;
+  if (!data || String(data.series_id || '') !== sid) throw new Error('App 详情返回的剧集与请求不一致');
+  const rows = Array.isArray(data.video_list) ? data.video_list : [];
+  if (!rows.length) throw new Error('App 详情分集列表为空');
+  const text = value => typeof value === 'string' ? value : '';
+  const episodes = rows.map((item, i) => {
+    const vid = String((item && item.vid) || '');
+    if (!/^\d{1,30}$/.test(vid) || (item.series_id != null && String(item.series_id) !== sid)) throw new Error('App 详情分集数据异常');
+    return { vid, vid_index: Number(item.vid_index) > 0 ? Number(item.vid_index) : i + 1, title: '', locked: item.disable_play === true };
+  }).sort((a, b) => a.vid_index - b.vid_index);
+  if (new Set(episodes.map(e => e.vid)).size !== episodes.length || Number(data.episode_cnt) > episodes.length) {
+    throw new Error('App 详情分集列表不完整');
+  }
+  return {
+    series_id: sid,
+    series_title: text(data.series_title) || text(data.series_name),
+    cover: text(data.series_cover) || text(data.cover_url),
+    intro: text(data.series_intro),
+    total: episodes.length,
+    episodes,
+  };
 }
 
 /**
